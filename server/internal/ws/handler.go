@@ -3,8 +3,8 @@ package ws
 import (
 	"context"
 	"net/http"
-    "regexp"
-    "strings"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,8 +105,8 @@ type Server struct {
 	}
 
 	// backpressure visible: drops por device (userID|deviceID)
-	dropsMu        sync.Mutex
-	dropsByDevice  map[string]int64
+	dropsMu       sync.Mutex
+	dropsByDevice map[string]int64
 }
 
 var deviceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -156,11 +156,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			tok := env.Hello.Token
 			uid := env.Hello.UserID
 			dev := env.Hello.DeviceID
-            dev = strings.TrimSpace(dev)
-            if !deviceIDRe.MatchString(dev) {
-                _ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
-                return
-            }
+			dev = strings.TrimSpace(dev)
+			if !deviceIDRe.MatchString(dev) {
+				_ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
+				return
+			}
 			if s.Auth != nil {
 				if got, ok := s.Auth(tok); !ok || (uid != "" && got != uid) {
 					_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
