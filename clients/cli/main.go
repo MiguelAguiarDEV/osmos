@@ -54,6 +54,7 @@ func dialAndHello(ctx context.Context, addr, token, device string) (*websocket.C
 	if err != nil {
 		return nil, err
 	}
+	c.SetReadLimit(types.WSReadLimit(types.MaxInlineBytes))
 	hello := types.Envelope{
 		Type:  "hello",
 		Hello: &types.Hello{Token: token, UserID: token, DeviceID: device},

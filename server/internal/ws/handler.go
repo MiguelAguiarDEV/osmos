@@ -129,6 +129,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	c.SetReadLimit(types.WSReadLimit(s.MaxInlineBytes))
 	defer c.Close(websocket.StatusNormalClosure, "")
 
 	var userID, deviceID string
@@ -154,22 +155,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			tok := env.Hello.Token
-			uid := env.Hello.UserID
-			dev := env.Hello.DeviceID
-			dev = strings.TrimSpace(dev)
+			uid := strings.TrimSpace(env.Hello.UserID)
+			dev := strings.TrimSpace(env.Hello.DeviceID)
 			if !deviceIDRe.MatchString(dev) {
 				_ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
 				return
 			}
 			if s.Auth != nil {
-				if got, ok := s.Auth(tok); !ok || (uid != "" && got != uid) {
+				got, ok := s.Auth(tok)
+				if !ok {
 					_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
 					return
 				}
+				// The authenticated identity is authoritative; the client-provided
+				// user_id is only a hint (the CLI sends the full token there).
+				uid = got
+			}
+			if uid == "" {
+				_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
+				return
 			}
 			userID, deviceID = uid, dev
-			s.addConn(uid, dev, c)
-			s.log("ws_hello", map[string]any{"user_id": uid, "device_id": dev})
+			s.addConn(userID, deviceID, c)
+			s.log("ws_hello", map[string]any{"user_id": userID, "device_id": deviceID})
 
 		case "clip":
 			if env.Clip == nil {
