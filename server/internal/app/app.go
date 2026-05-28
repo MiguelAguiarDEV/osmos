@@ -14,14 +14,14 @@ import (
     "time"
 
     "clip-sync/server/internal/httpapi"
-    "clip-sync/server/internal/hub"
     "clip-sync/server/internal/logx"
     "clip-sync/server/internal/ws"
 )
 
 type App struct {
-	Mux *http.ServeMux
-	WSS *ws.Server
+	Mux     *http.ServeMux
+	WSS     *ws.Server
+	Uploads *httpapi.UploadServer
 }
 
 func NewApp() *App {
@@ -31,13 +31,11 @@ func NewApp() *App {
         w.Write([]byte("ok"))
     })
 
-    h := hub.New(32)
     // configurar nivel de logs
     if lvl := os.Getenv("CLIPSYNC_LOG_LEVEL"); lvl != "" {
         logx.SetLevel(lvl)
     }
     wss := &ws.Server{
-        Hub: h,
         Auth: func(token string) (string, bool) {
             secret := os.Getenv("CLIPSYNC_HMAC_SECRET")
             if secret == "" {
@@ -64,6 +62,7 @@ func NewApp() *App {
         Dir:      envStr("CLIPSYNC_UPLOAD_DIR", "./uploads"),
         MaxBytes: int64(envInt("CLIPSYNC_UPLOAD_MAXBYTES", 50<<20)),
         Allowed:  splitCSV(envStr("CLIPSYNC_UPLOAD_ALLOWED", "")),
+        TTL:      envDuration("CLIPSYNC_UPLOAD_TTL", 0),
     }
     mux.HandleFunc("POST /upload", up.Upload)
     mux.HandleFunc("GET /d/{id}", up.Download)
@@ -85,7 +84,7 @@ func NewApp() *App {
 		_ = json.NewEncoder(w).Encode(wss.MetricsSnapshot())
 	})
 
-	return &App{Mux: mux, WSS: wss}
+	return &App{Mux: mux, WSS: wss, Uploads: up}
 }
 
 // Back-compat
@@ -109,6 +108,18 @@ func envStr(name, def string) string {
         return def
     }
     return v
+}
+
+func envDuration(name string, def time.Duration) time.Duration {
+    v := os.Getenv(name)
+    if v == "" {
+        return def
+    }
+    d, err := time.ParseDuration(v)
+    if err != nil {
+        return def
+    }
+    return d
 }
 
 func splitCSV(s string) []string {

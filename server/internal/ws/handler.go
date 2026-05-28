@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"clip-sync/server/internal/hub"
 	"clip-sync/server/pkg/types"
 
 	"github.com/coder/websocket"
@@ -81,7 +80,6 @@ func (d *dedupeCache) ExistsOrAdd(id string) bool {
 }
 
 type Server struct {
-	Hub                *hub.Hub
 	Auth               func(token string) (string, bool)
 	MaxInlineBytes     int
 	RateLimitPerSecond int

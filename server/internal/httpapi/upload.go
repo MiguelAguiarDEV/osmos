@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,12 +13,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type UploadServer struct {
 	Dir      string
 	MaxBytes int64
-	Allowed  []string // whitelist de mimes permitidos; vacío = desactivado
+	Allowed  []string      // whitelist de mimes permitidos; vacío = desactivado
+	TTL      time.Duration // borra blobs más viejos que esto; 0 = desactivado
 }
 
 type uploadResp struct {
@@ -126,6 +129,56 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// StartJanitor runs cleanup every interval until ctx is done. No-op if TTL<=0.
+func (s *UploadServer) StartJanitor(ctx context.Context, interval time.Duration) {
+	if s.TTL <= 0 || interval <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.cleanup(time.Now())
+			}
+		}
+	}()
+}
+
+// cleanup removes stored blobs and stale temp files older than TTL.
+func (s *UploadServer) cleanup(now time.Time) int {
+	if s.TTL <= 0 {
+		return 0
+	}
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !idRe.MatchString(name) && !strings.HasPrefix(name, ".upload-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > s.TTL {
+			if os.Remove(filepath.Join(s.Dir, name)) == nil {
+				removed++
+			}
+		}
+	}
+	return removed
 }
 
 func isAllowedMime(allowed []string, ct string) bool {

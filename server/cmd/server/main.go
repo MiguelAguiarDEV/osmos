@@ -28,6 +28,7 @@ func main() {
     uploadMax := flag.Int("upload-max-bytes", func() int { if v := os.Getenv("CLIPSYNC_UPLOAD_MAXBYTES"); v != "" { if n, err := strconv.Atoi(v); err == nil { return n } }; return 50 << 20 }(), "max bytes accepted by /upload")
     uploadAllowed := flag.String("upload-allowed", envOr("CLIPSYNC_UPLOAD_ALLOWED", ""), "comma-separated list of allowed MIME types (e.g. text/plain,image/*). Empty disables whitelist")
     inlineMax := flag.Int("inline-max-bytes", func() int { if v := os.Getenv("CLIPSYNC_INLINE_MAXBYTES"); v != "" { if n, err := strconv.Atoi(v); err == nil { return n } }; return 64 << 10 }(), "max inline clip size")
+    uploadTTL := flag.Duration("upload-ttl", func() time.Duration { if v := os.Getenv("CLIPSYNC_UPLOAD_TTL"); v != "" { if d, err := time.ParseDuration(v); err == nil { return d } }; return 0 }(), "delete uploads older than this; 0 disables (e.g. 24h)")
     logLevel := flag.String("log-level", envOr("CLIPSYNC_LOG_LEVEL", "info"), "log level: debug|info|error|off")
     pprofEn := flag.Bool("pprof", envOr("CLIPSYNC_PPROF", "") != "", "enable /debug/pprof endpoints")
     expvarEn := flag.Bool("expvar", envOr("CLIPSYNC_EXPVAR", "") != "", "enable /debug/vars endpoint")
@@ -38,11 +39,15 @@ func main() {
     _ = os.Setenv("CLIPSYNC_UPLOAD_MAXBYTES", fmt.Sprintf("%d", *uploadMax))
     _ = os.Setenv("CLIPSYNC_INLINE_MAXBYTES", fmt.Sprintf("%d", *inlineMax))
     _ = os.Setenv("CLIPSYNC_UPLOAD_ALLOWED", *uploadAllowed)
+    _ = os.Setenv("CLIPSYNC_UPLOAD_TTL", uploadTTL.String())
     _ = os.Setenv("CLIPSYNC_LOG_LEVEL", *logLevel)
     if *pprofEn { _ = os.Setenv("CLIPSYNC_PPROF", "1") } else { _ = os.Unsetenv("CLIPSYNC_PPROF") }
     if *expvarEn { _ = os.Setenv("CLIPSYNC_EXPVAR", "1") } else { _ = os.Unsetenv("CLIPSYNC_EXPVAR") }
 
     a := app.NewApp()
+
+    janitorCtx, janitorStop := context.WithCancel(context.Background())
+    a.Uploads.StartJanitor(janitorCtx, 10*time.Minute)
 
     srv := &http.Server{
         Addr:    *addr,
@@ -64,6 +69,7 @@ func main() {
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
 
+    janitorStop()
     a.WSS.Shutdown(ctx)
     if err := srv.Shutdown(ctx); err != nil {
         log.Printf("http shutdown: %v", err)
