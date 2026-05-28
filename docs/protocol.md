@@ -126,7 +126,7 @@ Returns `200 ok` for liveness checks.
 <a id="get-healthz"></a>
 ### GET /healthz
 
-Returns JSON with basic metrics: `clips_total`, `drops_total`, `conns_current`, and per‑device drops as `drops_device:<user|device>`.
+Returns JSON with basic metrics: `clips_total`, `drops_total`, `conns_current`, `users_current`, and per‑device drops as `drops_device:<user|device>`.
 
 <a id="server-configuration"></a>
 ## Server configuration

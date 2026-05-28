@@ -458,6 +458,9 @@ func (s *Server) MetricsSnapshot() map[string]int64 {
 		"drops_total":   atomic.LoadInt64(&s.metrics.drops),
 		"conns_current": atomic.LoadInt64(&s.metrics.conns),
 	}
+	s.mu.RLock()
+	m["users_current"] = int64(len(s.conns))
+	s.mu.RUnlock()
 	// incluir drops por device de forma plana, para mantener tipo map[string]int64
 	s.dropsMu.Lock()
 	for k, v := range s.dropsByDevice {

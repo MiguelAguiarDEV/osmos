@@ -9,6 +9,7 @@ import (
     "os"
     "os/signal"
     "strconv"
+    "syscall"
     "time"
 
     "clip-sync/server/internal/app"
@@ -64,7 +65,7 @@ func main() {
     log.Printf("clip-sync server listening on %s\n", *addr)
 
     stop := make(chan os.Signal, 1)
-    signal.Notify(stop, os.Interrupt)
+    signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
     <-stop
 
     log.Println("shutting down...")
