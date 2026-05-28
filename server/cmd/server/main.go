@@ -5,6 +5,7 @@ import (
     "flag"
     "fmt"
     "log"
+    "net"
     "net/http"
     "os"
     "os/signal"
@@ -20,6 +21,27 @@ func envOr(name, def string) string {
         return v
     }
     return def
+}
+
+// printLANHints logs ready-to-use client addresses for each non-loopback IPv4.
+func printLANHints(addr string) {
+    _, port, err := net.SplitHostPort(addr)
+    if err != nil || port == "" {
+        return
+    }
+    addrs, err := net.InterfaceAddrs()
+    if err != nil {
+        return
+    }
+    for _, a := range addrs {
+        ipnet, ok := a.(*net.IPNet)
+        if !ok || ipnet.IP.IsLoopback() {
+            continue
+        }
+        if ip4 := ipnet.IP.To4(); ip4 != nil {
+            log.Printf("  clients: --addr ws://%s:%s/ws", ip4, port)
+        }
+    }
 }
 
 func main() {
@@ -63,6 +85,7 @@ func main() {
         }
     }()
     log.Printf("clip-sync server listening on %s\n", *addr)
+    printLANHints(*addr)
 
     stop := make(chan os.Signal, 1)
     signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

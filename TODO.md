@@ -57,16 +57,22 @@
 - [X] Make HMAC auth work through the CLI (route by authenticated identity)
 - [X] Fix `sync` re-send loop with non-idempotent clipboard backends (Windows newline)
 - [X] Reconnect with backoff in `recv`/`watch`/`sync` (not just `listen`)
-- [X] WS keep-alive ping to detect dead/half-open connections (client)
+- [X] WS keep-alive ping to detect dead/half-open connections (client + server)
 - [X] macOS clipboard backend (`pbcopy`/`pbpaste`)
 - [X] TTL garbage collection for `/upload` blobs
 - [X] Remove unused `hub` package
+- [X] Large clips / `send --file` HTTP base fix (was 404 with `/ws` address)
+- [X] Connection-lifecycle correctness (identity-checked removal, no metric drift, map cleanup)
+- [X] Hello deadline (slowloris guard) + parallel broadcast fan-out
+- [X] Authenticate `/upload` and `/d/{id}`; per-user blob isolation
+- [X] Default per-device rate limit; graceful shutdown on SIGTERM
+- [X] CI: race detector, CLI tests, Go version from `go.work`
 
 ## Future Enhancements
 
-- [ ] Authenticate `/upload` and `/d/{id}` (currently rely on unguessable IDs + size/MIME limits)
-- [ ] Normalize line endings on apply so clipboard content is byte-identical across platforms
+- [ ] Normalize line endings on apply so clipboard content is byte-identical across platforms (product decision: changes user content)
 - [ ] Sync images/binary clipboard content (not just text)
+- [ ] Horizontal scale-out (shared pub/sub instead of in-memory per-instance fan-out)
 - [ ] Auto-configure server with default settings
 - [ ] Display local network IP + port on server startup for easy client connection
 - [ ] Graphical user interface (GUI) for server and client
