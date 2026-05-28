@@ -172,8 +172,9 @@ make build   # server -> bin/server, cli -> bin/cli
 * `--inline-max-bytes` (`CLIPSYNC_INLINE_MAXBYTES`): inline size limit (default 64 KiB).
 * `--upload-dir`, `--upload-max-bytes`, `--upload-allowed`: upload directory, max size, allowed MIME whitelist (supports wildcards like `image/*`).
 * `--upload-ttl` (`CLIPSYNC_UPLOAD_TTL`): delete uploaded blobs older than this duration, e.g. `24h` (default `0`, disabled).
+* `--rate-lps` (`CLIPSYNC_RATE_LPS`): per‑device clip rate limit per second (default `100`; `0` disables).
 * `--log-level` (`CLIPSYNC_LOG_LEVEL`): `debug|info|error|off`.
-* Optional security (HMAC): set `CLIPSYNC_HMAC_SECRET`. Token: `user:exp_unix:hex(hmac_sha256(secret, user|exp))`.
+* Auth: all of `/ws`, `/upload` and `/d/{id}` require the token. Optional HMAC: set `CLIPSYNC_HMAC_SECRET`; token format `user:exp_unix:hex(hmac_sha256(secret, user|exp))`.
 * TLS: use a reverse proxy (e.g., Caddy/Nginx) and connect via `wss://.../ws`.
 
 <a id="technical-specs"></a>

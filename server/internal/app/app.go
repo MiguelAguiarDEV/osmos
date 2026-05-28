@@ -50,7 +50,10 @@ func NewApp() *App {
     wss := &ws.Server{
         Auth:               auth,
         MaxInlineBytes:     envInt("CLIPSYNC_INLINE_MAXBYTES", 64<<10),
-        RateLimitPerSecond: envInt("CLIPSYNC_RATE_LPS", 0),
+        // Generous per-device cap: real clipboard traffic is well under this
+        // (watch polls a few times/sec), but it bounds a pathological flood.
+        // Set CLIPSYNC_RATE_LPS=0 / --rate-lps 0 to disable.
+        RateLimitPerSecond: envInt("CLIPSYNC_RATE_LPS", 100),
         Log: func(event string, fields map[string]any) {
             logx.Info(event, fields)
         },
