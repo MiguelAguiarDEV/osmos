@@ -51,8 +51,22 @@
 - [X] Dedupe by `msg_id` in server and client
 - [X] Binaries for Windows, macOS and Linux (release workflow)
 
+## v1.1 — Reliability & cross-platform
+
+- [X] Raise WS read limit so inline clips up to 64 KiB are delivered
+- [X] Make HMAC auth work through the CLI (route by authenticated identity)
+- [X] Fix `sync` re-send loop with non-idempotent clipboard backends (Windows newline)
+- [X] Reconnect with backoff in `recv`/`watch`/`sync` (not just `listen`)
+- [X] WS keep-alive ping to detect dead/half-open connections (client)
+- [X] macOS clipboard backend (`pbcopy`/`pbpaste`)
+- [X] TTL garbage collection for `/upload` blobs
+- [X] Remove unused `hub` package
+
 ## Future Enhancements
 
+- [ ] Authenticate `/upload` and `/d/{id}` (currently rely on unguessable IDs + size/MIME limits)
+- [ ] Normalize line endings on apply so clipboard content is byte-identical across platforms
+- [ ] Sync images/binary clipboard content (not just text)
 - [ ] Auto-configure server with default settings
 - [ ] Display local network IP + port on server startup for easy client connection
 - [ ] Graphical user interface (GUI) for server and client
