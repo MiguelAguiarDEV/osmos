@@ -396,20 +396,28 @@ func (s *Server) broadcast(userID, fromDevice string, env types.Envelope) {
 		targets = buildTargets()
 	}
 
+	// Write to peers in parallel: a slow or stalled peer must not delay delivery
+	// to the others (nor block the sender's read loop beyond one timeout).
+	var wg sync.WaitGroup
 	for _, pair := range targets {
 		dev := pair[0].(string)
 		c := pair[1].(*websocket.Conn)
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		if err := wsjson.Write(ctx, c, env); err != nil {
-			// contar como drop por backpressure/error de escritura
-			atomic.AddInt64(&s.metrics.drops, 1)
-			s.incDeviceDrop(userID, dev)
-			s.log("ws_drop_backpressure", map[string]any{
-				"user_id": userID, "device_id": dev, "error": err.Error(),
-			})
-		}
-		cancel()
+		wg.Add(1)
+		go func(dev string, c *websocket.Conn) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			if err := wsjson.Write(ctx, c, env); err != nil {
+				// contar como drop por backpressure/error de escritura
+				atomic.AddInt64(&s.metrics.drops, 1)
+				s.incDeviceDrop(userID, dev)
+				s.log("ws_drop_backpressure", map[string]any{
+					"user_id": userID, "device_id": dev, "error": err.Error(),
+				})
+			}
+		}(dev, c)
 	}
+	wg.Wait()
 }
 
 func (s *Server) incDeviceDrop(userID, deviceID string) {
