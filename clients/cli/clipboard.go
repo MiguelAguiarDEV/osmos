@@ -8,6 +8,30 @@ import (
 	"runtime"
 )
 
+// clipboardReadBackend returns the backend that will be used to read the
+// clipboard, or "" if none is available.
+func clipboardReadBackend() string {
+	if runtime.GOOS == "windows" {
+		return "powershell"
+	}
+	if runtime.GOOS == "darwin" {
+		if _, err := exec.LookPath("pbpaste"); err == nil {
+			return "pbpaste"
+		}
+		return ""
+	}
+	if _, err := exec.LookPath("wl-paste"); err == nil {
+		return "wl-paste"
+	}
+	if _, err := exec.LookPath("xclip"); err == nil {
+		return "xclip"
+	}
+	if _, err := exec.LookPath("xsel"); err == nil {
+		return "xsel"
+	}
+	return ""
+}
+
 // clipboardWriteBackend returns the backend name that will be used to write clipboard.
 func clipboardWriteBackend() string {
 	if runtime.GOOS == "windows" {

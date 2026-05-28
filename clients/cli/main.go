@@ -501,6 +501,21 @@ func main() {
 	flag.Parse()
 	cliToken = *token
 
+	// Fail fast (instead of reconnecting forever) if a mode needs the OS
+	// clipboard but no backend is installed.
+	switch *mode {
+	case "watch", "sync":
+		if clipboardReadBackend() == "" {
+			fatalf(exitUsage, "no clipboard backend found to read; install wl-clipboard or xclip (Linux), or use macOS/Windows")
+		}
+	}
+	switch *mode {
+	case "recv", "sync":
+		if clipboardWriteBackend() == "" {
+			fatalf(exitUsage, "no clipboard backend found to write; install wl-clipboard or xclip (Linux), or use macOS/Windows")
+		}
+	}
+
 	switch *mode {
 	case "listen":
 		runWithReconnect(*addr, *token, *device, func(ctx context.Context, c *websocket.Conn) error {
