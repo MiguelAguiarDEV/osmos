@@ -72,3 +72,37 @@ func TestUploadNoAuthConfigured(t *testing.T) {
 		t.Fatalf("no-auth upload: got %d, want 200", rr.Code)
 	}
 }
+
+// A blob uploaded by one user must not be downloadable by another, even with a
+// valid token and the correct id (per-user namespace isolation).
+func TestUploadDownloadUserIsolation(t *testing.T) {
+	dir := t.TempDir()
+	// every non-empty token authenticates as itself (MVP-style)
+	s := &UploadServer{Dir: dir, MaxBytes: 1 << 20, Auth: func(tok string) (string, bool) { return tok, tok != "" }}
+
+	up := httptest.NewRequest(http.MethodPost, "/upload", bytes.NewReader([]byte("alice-secret")))
+	up.Header.Set("Authorization", "Bearer alice")
+	rrUp := httptest.NewRecorder()
+	s.Upload(rrUp, up)
+	if rrUp.Code != http.StatusOK {
+		t.Fatalf("alice upload: %d", rrUp.Code)
+	}
+	var resp uploadResp
+	_ = json.NewDecoder(rrUp.Body).Decode(&resp)
+	id := strings.TrimPrefix(resp.UploadURL, "/d/")
+
+	get := func(user string) int {
+		req := httptest.NewRequest(http.MethodGet, resp.UploadURL, nil)
+		req.SetPathValue("id", id)
+		req.Header.Set("Authorization", "Bearer "+user)
+		rr := httptest.NewRecorder()
+		s.Download(rr, req)
+		return rr.Code
+	}
+	if code := get("bob"); code != http.StatusNotFound {
+		t.Fatalf("bob should not read alice's blob: got %d, want 404", code)
+	}
+	if code := get("alice"); code != http.StatusOK {
+		t.Fatalf("alice should read her own blob: got %d, want 200", code)
+	}
+}

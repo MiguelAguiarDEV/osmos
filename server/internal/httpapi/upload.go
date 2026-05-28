@@ -3,10 +3,12 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
@@ -33,32 +35,39 @@ type uploadResp struct {
 
 var idRe = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
-// authed reports whether the request carries a valid bearer token. When no Auth
-// is configured it always passes.
-func (s *UploadServer) authed(r *http.Request) bool {
+// userDir returns the storage directory for the request's authenticated user
+// and whether the request is authorized. Blobs live under a per-user namespace
+// so one user can't fetch another's blob even if they learn its id. With no
+// Auth configured it falls back to the flat directory (tests/back-compat).
+func (s *UploadServer) userDir(r *http.Request) (string, bool) {
 	if s.Auth == nil {
-		return true
+		return s.Dir, true
 	}
 	tok := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(tok) >= 7 && strings.EqualFold(tok[:7], "Bearer ") {
 		tok = strings.TrimSpace(tok[7:])
 	}
 	if tok == "" {
-		return false
+		return "", false
 	}
-	_, ok := s.Auth(tok)
-	return ok
+	uid, ok := s.Auth(tok)
+	if !ok || uid == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return filepath.Join(s.Dir, hex.EncodeToString(sum[:])), true
 }
 
 func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	dir, ok := s.userDir(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if s.MaxBytes > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBytes)
 	}
-	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
@@ -79,10 +88,10 @@ func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := randHex(16)
-	final := filepath.Join(s.Dir, id)
+	final := filepath.Join(dir, id)
 
 	// escribir a tmp y luego rename
-	tmp, err := os.CreateTemp(s.Dir, ".upload-*")
+	tmp, err := os.CreateTemp(dir, ".upload-*")
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
@@ -127,7 +136,8 @@ func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *UploadServer) Download(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	dir, ok := s.userDir(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -136,7 +146,7 @@ func (s *UploadServer) Download(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	fp := filepath.Join(s.Dir, id)
+	fp := filepath.Join(dir, id)
 	f, err := os.Open(fp)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -178,34 +188,32 @@ func (s *UploadServer) StartJanitor(ctx context.Context, interval time.Duration)
 	}()
 }
 
-// cleanup removes stored blobs and stale temp files older than TTL.
+// cleanup removes stored blobs and stale temp files older than TTL. It walks
+// recursively so per-user namespace subdirectories are covered too.
 func (s *UploadServer) cleanup(now time.Time) int {
 	if s.TTL <= 0 {
 		return 0
 	}
-	entries, err := os.ReadDir(s.Dir)
-	if err != nil {
-		return 0
-	}
 	removed := 0
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	_ = filepath.WalkDir(s.Dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
 		}
-		name := e.Name()
+		name := d.Name()
 		if !idRe.MatchString(name) && !strings.HasPrefix(name, ".upload-") {
-			continue
+			return nil
 		}
-		info, err := e.Info()
+		info, err := d.Info()
 		if err != nil {
-			continue
+			return nil
 		}
 		if now.Sub(info.ModTime()) > s.TTL {
-			if os.Remove(filepath.Join(s.Dir, name)) == nil {
+			if os.Remove(path) == nil {
 				removed++
 			}
 		}
-	}
+		return nil
+	})
 	return removed
 }
 
