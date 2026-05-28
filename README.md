@@ -173,17 +173,37 @@ make build   # server -> bin/server, cli -> bin/cli
 * `--upload-dir`, `--upload-max-bytes`, `--upload-allowed`: upload directory, max size, allowed MIME whitelist (supports wildcards like `image/*`).
 * `--upload-ttl` (`CLIPSYNC_UPLOAD_TTL`): delete uploaded blobs older than this duration, e.g. `24h` (default `0`, disabled).
 * `--rate-lps` (`CLIPSYNC_RATE_LPS`): per‑device clip rate limit per second (default `100`; `0` disables).
+* `--redis-url` (`CLIPSYNC_REDIS_URL`): Redis URL (e.g. `redis://host:6379/0`) to fan out across multiple server instances. Empty = single instance. See [Scaling](#scaling).
+* `--redis-channel` (`CLIPSYNC_REDIS_CHANNEL`): Redis pub/sub channel (default `clipsync`).
 * `--log-level` (`CLIPSYNC_LOG_LEVEL`): `debug|info|error|off`.
 * Auth: all of `/ws`, `/upload` and `/d/{id}` require the token. Optional HMAC: set `CLIPSYNC_HMAC_SECRET`; token format `user:exp_unix:hex(hmac_sha256(secret, user|exp))`.
 * TLS: use a reverse proxy (e.g., Caddy/Nginx) and connect via `wss://.../ws`.
+
+<a id="scaling"></a>
+
+## Scaling
+
+A single instance keeps connections in memory and fans clips out locally — no
+extra setup needed. To run **multiple instances** behind a load balancer (so a
+user's devices can land on any instance), point them all at the same Redis:
+
+```bash
+./server_linux_amd64 --addr 0.0.0.0:8080 --redis-url redis://10.0.0.5:6379/0
+```
+
+Each instance publishes clips to a shared Redis channel and delivers received
+clips to its own connected devices. Uploaded blobs are written to `--upload-dir`,
+so for multi-instance use put that on shared storage (or a shared object store)
+reachable by every instance. If Redis is unreachable at startup the instance
+logs an error and falls back to single-instance mode.
 
 <a id="technical-specs"></a>
 
 ## Technical Specs
 
-* Stack: Go 1.22, WebSocket (`/ws`) + HTTP (`/upload`, `/d/{id}`, `/health`, `/healthz`).
-* Architecture: per‑user fan‑out to devices; no echo to sender.
-* Scalability: client exponential backoff; dedup by `msg_id` on server and client.
+* Stack: Go 1.24, WebSocket (`/ws`) + HTTP (`/upload`, `/d/{id}`, `/health`, `/healthz`).
+* Architecture: per‑user fan‑out to devices; no echo to sender. Optional Redis pub/sub for multi‑instance fan‑out.
+* Scalability: client exponential backoff; dedup by `msg_id` on server and client; horizontal scale‑out via Redis.
 * Clipboard backends:
   * Windows: `clip.exe` or PowerShell (`Get-Clipboard` / `Set-Clipboard`).
   * Linux: Wayland `wl-clipboard` or X11 `xclip` / `xsel`.

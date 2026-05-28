@@ -53,6 +53,8 @@ func main() {
     inlineMax := flag.Int("inline-max-bytes", func() int { if v := os.Getenv("CLIPSYNC_INLINE_MAXBYTES"); v != "" { if n, err := strconv.Atoi(v); err == nil { return n } }; return 64 << 10 }(), "max inline clip size")
     uploadTTL := flag.Duration("upload-ttl", func() time.Duration { if v := os.Getenv("CLIPSYNC_UPLOAD_TTL"); v != "" { if d, err := time.ParseDuration(v); err == nil { return d } }; return 0 }(), "delete uploads older than this; 0 disables (e.g. 24h)")
     rateLPS := flag.Int("rate-lps", func() int { if v := os.Getenv("CLIPSYNC_RATE_LPS"); v != "" { if n, err := strconv.Atoi(v); err == nil { return n } }; return 100 }(), "per-device clip rate limit per second (0 disables)")
+    redisURL := flag.String("redis-url", envOr("CLIPSYNC_REDIS_URL", ""), "redis URL for multi-instance fan-out, e.g. redis://host:6379/0 (empty = single instance)")
+    redisChan := flag.String("redis-channel", envOr("CLIPSYNC_REDIS_CHANNEL", "clipsync"), "redis pub/sub channel for fan-out")
     logLevel := flag.String("log-level", envOr("CLIPSYNC_LOG_LEVEL", "info"), "log level: debug|info|error|off")
     pprofEn := flag.Bool("pprof", envOr("CLIPSYNC_PPROF", "") != "", "enable /debug/pprof endpoints")
     expvarEn := flag.Bool("expvar", envOr("CLIPSYNC_EXPVAR", "") != "", "enable /debug/vars endpoint")
@@ -65,6 +67,8 @@ func main() {
     _ = os.Setenv("CLIPSYNC_UPLOAD_ALLOWED", *uploadAllowed)
     _ = os.Setenv("CLIPSYNC_UPLOAD_TTL", uploadTTL.String())
     _ = os.Setenv("CLIPSYNC_RATE_LPS", fmt.Sprintf("%d", *rateLPS))
+    _ = os.Setenv("CLIPSYNC_REDIS_URL", *redisURL)
+    _ = os.Setenv("CLIPSYNC_REDIS_CHANNEL", *redisChan)
     _ = os.Setenv("CLIPSYNC_LOG_LEVEL", *logLevel)
     if *pprofEn { _ = os.Setenv("CLIPSYNC_PPROF", "1") } else { _ = os.Unsetenv("CLIPSYNC_PPROF") }
     if *expvarEn { _ = os.Setenv("CLIPSYNC_EXPVAR", "1") } else { _ = os.Unsetenv("CLIPSYNC_EXPVAR") }

@@ -13,6 +13,7 @@ import (
     "strings"
     "time"
 
+    "clip-sync/server/internal/broker"
     "clip-sync/server/internal/httpapi"
     "clip-sync/server/internal/logx"
     "clip-sync/server/internal/ws"
@@ -60,6 +61,19 @@ func NewApp() *App {
     }
 	// dedupe: capacidad LRU por usuario desde env (0 = off)
 	wss.SetDedupeCapacity(envInt("CLIPSYNC_DEDUPE", 128))
+
+	// fan-out broker: Redis for multi-instance, else single-instance Local.
+	if url := os.Getenv("CLIPSYNC_REDIS_URL"); url != "" {
+		if rb, err := broker.NewRedis(url, envStr("CLIPSYNC_REDIS_CHANNEL", "clipsync")); err != nil {
+			logx.Error("redis_broker_init_failed", map[string]any{"error": err.Error(), "fallback": "local"})
+			wss.SetBroker(broker.NewLocal())
+		} else {
+			logx.Info("redis_broker", map[string]any{"channel": envStr("CLIPSYNC_REDIS_CHANNEL", "clipsync")})
+			wss.SetBroker(rb)
+		}
+	} else {
+		wss.SetBroker(broker.NewLocal())
+	}
 
 	mux.Handle("/ws", wss)
 

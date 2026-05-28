@@ -22,6 +22,8 @@
   - WebSocket keep-alive ping detects dead/half-open connections.
   - Received `upload_url` downloads are bounded (timeout + size cap).
   - Fails fast with a clear message when no clipboard backend is installed.
+  - Line endings normalized to LF (trailing trimmed) so synced content is
+    byte-identical across platforms (`--normalize-eol=false` to opt out).
   - macOS clipboard backend (`pbcopy`/`pbpaste`).
 - Server
   - `/upload` and `/d/{id}` now require the bearer token, and blobs are isolated
@@ -32,7 +34,11 @@
   - Per-device rate limit defaults to 100/s (`--rate-lps`, 0 disables).
   - Optional TTL garbage collection of `/upload` blobs (`--upload-ttl`).
   - Graceful shutdown on SIGTERM; `users_current` metric in `/healthz`.
-  - Removed the unused `hub` package.
+  - Prints LAN client addresses on startup.
+  - Removed the unused `hub` package; clip fan-out goes through a pluggable
+    broker (Local by default).
+  - Horizontal scale-out: optional Redis pub/sub fan-out across instances
+    (`--redis-url`).
 - Tests & CI
   - Race detector and CLI tests now run in CI; Go version read from `go.work`.
   - Added reconnect, hello-timeout, upload-auth, per-user isolation, churn

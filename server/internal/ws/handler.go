@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"clip-sync/server/internal/broker"
 	"clip-sync/server/pkg/types"
 
 	"github.com/coder/websocket"
@@ -90,6 +92,10 @@ type Server struct {
 
 	// logger: si es nil, no loggea
 	Log func(event string, fields map[string]any)
+
+	// broker fans clips out (Local by default; Redis for multi-instance).
+	broker     broker.Broker
+	brokerOnce sync.Once
 
 	mu    sync.RWMutex
 	conns map[string]map[string]*websocket.Conn // userID -> deviceID -> conn
@@ -247,7 +253,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				From: deviceID,
 				Clip: clip,
 			}
-			s.broadcast(userID, deviceID, out)
+			if payload, err := json.Marshal(out); err == nil {
+				s.publish(userID, deviceID, payload)
+			}
 			s.log("ws_clip", map[string]any{
 				"user_id": userID, "device_id": deviceID, "msg_id": clip.MsgID,
 				"mime": clip.Mime, "size": clip.Size, "has_data": len(clip.Data) > 0,
@@ -374,50 +382,61 @@ func (s *Server) removeConn(userID, deviceID string, c *websocket.Conn) {
 	}
 }
 
-func (s *Server) broadcast(userID, fromDevice string, env types.Envelope) {
-	buildTargets := func() [][2]interface{} {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		list := make([][2]interface{}, 0, 4)
-		if peers := s.conns[userID]; peers != nil {
-			for dev, c := range peers {
-				if dev == fromDevice {
-					continue
-				}
-				list = append(list, [2]interface{}{dev, c})
+// SetBroker wires a fan-out broker (e.g. Redis for multi-instance). If never
+// called, a Local broker is used on first publish.
+func (s *Server) SetBroker(b broker.Broker) {
+	s.brokerOnce.Do(func() {
+		s.broker = b
+		b.SetHandler(s.deliverLocal)
+	})
+}
+
+// publish hands the marshalled clip to the broker, which delivers it to every
+// instance's local connections (including this one) via deliverLocal.
+func (s *Server) publish(userID, fromDevice string, payload []byte) {
+	s.SetBroker(broker.NewLocal()) // no-op if a broker is already set
+	s.broker.Publish(userID, fromDevice, payload)
+}
+
+type target struct {
+	dev string
+	c   *websocket.Conn
+}
+
+// deliverLocal writes payload to this instance's connections for userID,
+// skipping fromDevice, and returns the number of local recipients. Peers are
+// written in parallel so one slow peer can't delay the others.
+func (s *Server) deliverLocal(userID, fromDevice string, payload []byte) int {
+	s.mu.RLock()
+	var targets []target
+	if peers := s.conns[userID]; peers != nil {
+		targets = make([]target, 0, len(peers))
+		for dev, c := range peers {
+			if dev != fromDevice {
+				targets = append(targets, target{dev, c})
 			}
 		}
-		return list
 	}
+	s.mu.RUnlock()
 
-	targets := buildTargets()
-	if len(targets) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		targets = buildTargets()
-	}
-
-	// Write to peers in parallel: a slow or stalled peer must not delay delivery
-	// to the others (nor block the sender's read loop beyond one timeout).
 	var wg sync.WaitGroup
-	for _, pair := range targets {
-		dev := pair[0].(string)
-		c := pair[1].(*websocket.Conn)
+	for _, t := range targets {
 		wg.Add(1)
 		go func(dev string, c *websocket.Conn) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
-			if err := wsjson.Write(ctx, c, env); err != nil {
-				// contar como drop por backpressure/error de escritura
+			if err := c.Write(ctx, websocket.MessageText, payload); err != nil {
 				atomic.AddInt64(&s.metrics.drops, 1)
 				s.incDeviceDrop(userID, dev)
 				s.log("ws_drop_backpressure", map[string]any{
 					"user_id": userID, "device_id": dev, "error": err.Error(),
 				})
 			}
-		}(dev, c)
+		}(t.dev, t.c)
 	}
 	wg.Wait()
+	return len(targets)
 }
 
 func (s *Server) incDeviceDrop(userID, deviceID string) {

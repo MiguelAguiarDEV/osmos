@@ -135,6 +135,8 @@ Flags (all have env equivalents):
 - `--addr` (`CLIPSYNC_ADDR`): listen address, default `:8080`.
 - `--upload-dir`, `--upload-max-bytes`, `--upload-allowed`.
 - `--inline-max-bytes` (`CLIPSYNC_INLINE_MAXBYTES`).
+- `--upload-ttl` (`CLIPSYNC_UPLOAD_TTL`) and `--rate-lps` (`CLIPSYNC_RATE_LPS`).
+- `--redis-url` (`CLIPSYNC_REDIS_URL`) and `--redis-channel` (`CLIPSYNC_REDIS_CHANNEL`): multi-instance fan-out.
 - `--log-level` (`CLIPSYNC_LOG_LEVEL`): `debug|info|error|off`.
 - `--pprof` (`CLIPSYNC_PPROF`) and `--expvar` (`CLIPSYNC_EXPVAR`).
 
