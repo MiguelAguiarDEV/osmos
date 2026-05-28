@@ -39,7 +39,10 @@ func (s *UploadServer) authed(r *http.Request) bool {
 	if s.Auth == nil {
 		return true
 	}
-	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	tok := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(tok) >= 7 && strings.EqualFold(tok[:7], "Bearer ") {
+		tok = strings.TrimSpace(tok[7:])
+	}
 	if tok == "" {
 		return false
 	}
