@@ -32,6 +32,24 @@ func TestDetectMime(t *testing.T) {
     if got := detectMime("noext", "application/octet-stream"); got != "application/octet-stream" { t.Fatalf("fallback: %s", got) }
 }
 
+func TestNormalizeEOL(t *testing.T) {
+    cases := map[string]string{
+        "hello":             "hello",
+        "hello\n":           "hello",
+        "hello\r\n":         "hello",
+        "hello\r\nworld\r\n": "hello\nworld",
+        "a\rb":              "a\nb",
+        "trail\n\n\n":       "trail",
+        "":                  "",
+        "\r\n":              "",
+    }
+    for in, want := range cases {
+        if got := normalizeEOL(in); got != want {
+            t.Errorf("normalizeEOL(%q) = %q, want %q", in, got, want)
+        }
+    }
+}
+
 // The HTTP base must drop the ws path; otherwise uploads hit /ws/upload (404).
 func TestHTTPBaseFromWS(t *testing.T) {
     cases := map[string]string{

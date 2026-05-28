@@ -39,6 +39,27 @@ const maxClipDownload = 64 << 20 // 64 MiB
 // cliToken is the auth token for HTTP upload/download, set once in main.
 var cliToken string
 
+// eolNormalize controls line-ending canonicalization (set from --normalize-eol).
+var eolNormalize = true
+
+// normalizeEOL canonicalizes line endings to LF and trims trailing newlines so
+// clipboard content is byte-identical across platforms and the Windows
+// Get-Clipboard trailing-newline artifact can't drive a re-send.
+func normalizeEOL(s string) string {
+	if strings.IndexByte(s, '\r') >= 0 {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		s = strings.ReplaceAll(s, "\r", "\n")
+	}
+	return strings.TrimRight(s, "\n")
+}
+
+func maybeNormalizeEOL(s string) string {
+	if eolNormalize {
+		return normalizeEOL(s)
+	}
+	return s
+}
+
 func fatalf(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(code)
@@ -209,33 +230,34 @@ func runRecvApply(ctx context.Context, c *websocket.Conn, wsAddr string, markRem
 			if len(data) == 0 {
 				continue
 			}
-			if verbose {
-				fmt.Printf("[recv] applying to clipboard: from=%s bytes=%d backend=%s\n", env.From, len(data), clipboardWriteBackend())
+			text := maybeNormalizeEOL(string(data))
+			if text == "" {
+				continue
 			}
-			if err := setClipboardText(string(data)); err != nil {
+			if verbose {
+				fmt.Printf("[recv] applying to clipboard: from=%s bytes=%d backend=%s\n", env.From, len(text), clipboardWriteBackend())
+			}
+			if err := setClipboardText(text); err != nil {
 				fmt.Fprintln(os.Stderr, "set clipboard failed:", err)
 				continue
 			}
-			markRemote(hashBytes(data))
-			// Re-read the clipboard once: mark the hash of what it actually holds
-			// after applying, not the bytes we received. Some backends are
-			// non-idempotent on read-back (e.g. Windows Get-Clipboard appends a
-			// trailing newline), which would otherwise make the watcher treat the
-			// applied value as a new local change and re-send it — a sync loop.
-			applied := string(data)
+			// Mark the canonical hash of what the clipboard holds after applying
+			// (read-back), not the bytes received: some backends are
+			// non-idempotent on read (Windows Get-Clipboard appends a newline),
+			// which would otherwise make the watcher re-send it — a sync loop.
+			markRemote(hashString(text))
 			readback, rerr := getClipboardText()
 			if rerr == nil {
-				applied = readback
-				markRemote(hashBytes([]byte(applied)))
+				markRemote(hashString(maybeNormalizeEOL(readback)))
 			}
 			if verbose {
 				if rerr == nil {
-					ok := applied == string(data)
-					prev := applied
+					rb := maybeNormalizeEOL(readback)
+					prev := rb
 					if len(prev) > 80 {
 						prev = prev[:80] + "…"
 					}
-					fmt.Printf("[recv] clipboard updated from %s, verify=%v len=%d preview=%q\n", env.From, ok, len(applied), prev)
+					fmt.Printf("[recv] clipboard updated from %s, verify=%v len=%d preview=%q\n", env.From, rb == text, len(rb), prev)
 				} else {
 					fmt.Printf("[recv] clipboard updated from %s (unable to read back: %v)\n", env.From, rerr)
 				}
@@ -261,10 +283,11 @@ func runWatchLoop(ctx context.Context, c *websocket.Conn, wsAddr string, interva
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			txt, err := getClipboardText()
+			raw, err := getClipboardText()
 			if err != nil {
 				return err
 			}
+			txt := maybeNormalizeEOL(raw)
 			h := hashString(txt)
 			if lr := lastRemote(); lr != "" && lr == h {
 				clearRemote()
@@ -497,9 +520,11 @@ func main() {
 	file := flag.String("file", "", "path to file to send (uses HTTP /upload)")
 	mime := flag.String("mime", "", "mime type for --file (auto-detect if empty)")
 	poll := flag.Int("poll-ms", 400, "clipboard poll interval for watch/sync")
+	normEOL := flag.Bool("normalize-eol", true, "canonicalize line endings (CRLF→LF, trim trailing) so content matches across platforms")
 	verbose := flag.Bool("v", false, "verbose logging (debug)")
 	flag.Parse()
 	cliToken = *token
+	eolNormalize = *normEOL
 
 	// Fail fast (instead of reconnecting forever) if a mode needs the OS
 	// clipboard but no backend is installed.
