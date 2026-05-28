@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,10 @@ const (
 	exitUpload = 11
 	exitSend   = 12
 )
+
+// maxClipDownload caps how much a received upload_url clip may pull into memory
+// before being applied to the clipboard.
+const maxClipDownload = 64 << 20 // 64 MiB
 
 func fatalf(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -66,14 +71,23 @@ func dialAndHello(ctx context.Context, addr, token, device string) (*websocket.C
 	return c, nil
 }
 
+// httpBaseFromWS derives the HTTP base (scheme://host) from a ws endpoint.
+// The /upload and /d/{id} routes live at the root, so the ws path (e.g. "/ws")
+// must be dropped — otherwise uploads hit "/ws/upload" and 404.
 func httpBaseFromWS(wsAddr string) string {
-	if strings.HasPrefix(wsAddr, "wss://") {
-		return "https://" + strings.TrimPrefix(wsAddr, "wss://")
+	s := wsAddr
+	switch {
+	case strings.HasPrefix(s, "wss://"):
+		s = "https://" + strings.TrimPrefix(s, "wss://")
+	case strings.HasPrefix(s, "ws://"):
+		s = "http://" + strings.TrimPrefix(s, "ws://")
+	case !strings.Contains(s, "://"):
+		s = "http://" + s
 	}
-	if strings.HasPrefix(wsAddr, "ws://") {
-		return "http://" + strings.TrimPrefix(wsAddr, "ws://")
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return u.Scheme + "://" + u.Host
 	}
-	return "http://" + wsAddr
+	return s
 }
 
 func uploadFile(ctx context.Context, httpBase, path, contentType string) (uploadURL string, size int, err error) {
@@ -156,16 +170,29 @@ func runRecvApply(ctx context.Context, c *websocket.Conn, wsAddr string, markRem
 				data = cl.Data
 			} else if cl.UploadURL != "" {
 				u := strings.TrimRight(base, "/") + cl.UploadURL
-				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+				dctx, dcancel := context.WithTimeout(ctx, 30*time.Second)
+				req, _ := http.NewRequestWithContext(dctx, http.MethodGet, u, nil)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
+					dcancel()
 					fmt.Fprintln(os.Stderr, "download failed:", err)
 					continue
 				}
-				b, _ := io.ReadAll(resp.Body)
+				// Bound the read: don't let a huge/slow blob OOM us or block the
+				// read loop indefinitely.
+				b, rerr := io.ReadAll(io.LimitReader(resp.Body, maxClipDownload+1))
 				resp.Body.Close()
+				dcancel()
 				if resp.StatusCode != http.StatusOK {
 					fmt.Fprintf(os.Stderr, "download failed: status=%d\n", resp.StatusCode)
+					continue
+				}
+				if rerr != nil {
+					fmt.Fprintln(os.Stderr, "download read failed:", rerr)
+					continue
+				}
+				if len(b) > maxClipDownload {
+					fmt.Fprintf(os.Stderr, "download too large (> %d bytes), skipping\n", maxClipDownload)
 					continue
 				}
 				data = b
