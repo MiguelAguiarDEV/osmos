@@ -109,6 +109,10 @@ type Server struct {
 
 var deviceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// helloTimeout bounds how long an unauthenticated connection may stay open
+// before sending a valid hello. Overridable in tests.
+var helloTimeout = 10 * time.Second
+
 func (s *Server) SetDedupeCapacity(n int) {
 	s.ddmu.Lock()
 	s.ddcap = n
@@ -130,7 +134,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.SetReadLimit(types.WSReadLimit(s.MaxInlineBytes))
 	defer c.Close(websocket.StatusNormalClosure, "")
 
+	pingCtx, pingCancel := context.WithCancel(r.Context())
+	defer pingCancel()
+
 	var userID, deviceID string
+	pingerStarted := false
 
 	s.mu.Lock()
 	if s.conns == nil {
@@ -140,9 +148,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		var env types.Envelope
-		if err := wsjson.Read(r.Context(), c, &env); err != nil {
+		// Until authenticated, bound the read so connections that upgrade but
+		// never send a valid hello can't pile up (slowloris). Afterwards the
+		// pinger handles liveness.
+		readCtx := r.Context()
+		var rcancel context.CancelFunc
+		if userID == "" {
+			readCtx, rcancel = context.WithTimeout(r.Context(), helloTimeout)
+		}
+		err := wsjson.Read(readCtx, c, &env)
+		if rcancel != nil {
+			rcancel()
+		}
+		if err != nil {
 			if userID != "" && deviceID != "" {
-				s.removeConn(userID, deviceID)
+				s.removeConn(userID, deviceID, c)
 			}
 			return
 		}
@@ -175,6 +195,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			userID, deviceID = uid, dev
 			s.addConn(userID, deviceID, c)
+			if !pingerStarted {
+				pingerStarted = true
+				go s.pinger(pingCtx, c)
+			}
 			s.log("ws_hello", map[string]any{"user_id": userID, "device_id": deviceID})
 
 		case "clip":
@@ -262,27 +286,81 @@ func (s *Server) allow(userID, deviceID string) bool {
 	return lim.allow()
 }
 
+// pinger keeps a client connection liveness-checked: a failed ping (dead or
+// half-open client) closes the connection so the read loop ends and the conn is
+// removed, instead of lingering and stalling every broadcast on a 1s timeout.
+func (s *Server) pinger(ctx context.Context, c *websocket.Conn) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := c.Ping(pctx)
+			cancel()
+			if err != nil {
+				_ = c.Close(websocket.StatusGoingAway, "ping timeout")
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) addConn(userID, deviceID string, c *websocket.Conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.conns[userID] == nil {
 		s.conns[userID] = make(map[string]*websocket.Conn)
 	}
+	old := s.conns[userID][deviceID]
 	s.conns[userID][deviceID] = c
-	atomic.AddInt64(&s.metrics.conns, 1)
+	if old == nil {
+		atomic.AddInt64(&s.metrics.conns, 1)
+	}
+	s.mu.Unlock()
+	// A device_id is single-connection: the newest wins. Close any prior
+	// connection for this device so its read loop ends (its removeConn is a
+	// no-op thanks to the identity check below). Done outside the lock.
+	if old != nil && old != c {
+		_ = old.Close(websocket.StatusPolicyViolation, "replaced by new connection")
+	}
 }
 
-func (s *Server) removeConn(userID, deviceID string) {
+func (s *Server) removeConn(userID, deviceID string, c *websocket.Conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	removed := false
 	if m := s.conns[userID]; m != nil {
-		if _, ok := m[deviceID]; ok {
+		// Only remove if the stored connection is the one leaving; otherwise a
+		// stale old connection would evict the live reconnected one.
+		if cur, ok := m[deviceID]; ok && cur == c {
 			delete(m, deviceID)
 			atomic.AddInt64(&s.metrics.conns, -1)
+			removed = true
 		}
 		if len(m) == 0 {
 			delete(s.conns, userID)
 		}
+	}
+	_, roomAlive := s.conns[userID]
+	s.mu.Unlock()
+
+	if !removed {
+		return
+	}
+	// Free per-device/per-user state so these maps don't grow without bound as
+	// devices churn. Only runs when the leaving conn was the live one.
+	key := userID + "|" + deviceID
+	s.rlmu.Lock()
+	delete(s.rl, key)
+	s.rlmu.Unlock()
+	s.dropsMu.Lock()
+	delete(s.dropsByDevice, key)
+	s.dropsMu.Unlock()
+	if !roomAlive {
+		s.ddmu.Lock()
+		delete(s.dd, userID)
+		s.ddmu.Unlock()
 	}
 }
 
