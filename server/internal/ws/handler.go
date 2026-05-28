@@ -84,6 +84,10 @@ type Server struct {
 	MaxInlineBytes     int
 	RateLimitPerSecond int
 
+	// helloTimeout bounds how long an unauthenticated connection may stay open
+	// before sending a valid hello (0 = defaultHelloTimeout).
+	helloTimeout time.Duration
+
 	// logger: si es nil, no loggea
 	Log func(event string, fields map[string]any)
 
@@ -109,9 +113,7 @@ type Server struct {
 
 var deviceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// helloTimeout bounds how long an unauthenticated connection may stay open
-// before sending a valid hello. Overridable in tests.
-var helloTimeout = 10 * time.Second
+const defaultHelloTimeout = 10 * time.Second
 
 func (s *Server) SetDedupeCapacity(n int) {
 	s.ddmu.Lock()
@@ -139,6 +141,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var userID, deviceID string
 	pingerStarted := false
+	// Absolute deadline for completing authentication. Using a fixed deadline
+	// (not a per-read timeout) means a client can't keep an unauthenticated
+	// connection alive forever by dribbling junk messages.
+	hto := s.helloTimeout
+	if hto <= 0 {
+		hto = defaultHelloTimeout
+	}
+	authDeadline := time.Now().Add(hto)
 
 	s.mu.Lock()
 	if s.conns == nil {
@@ -154,7 +164,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		readCtx := r.Context()
 		var rcancel context.CancelFunc
 		if userID == "" {
-			readCtx, rcancel = context.WithTimeout(r.Context(), helloTimeout)
+			readCtx, rcancel = context.WithDeadline(r.Context(), authDeadline)
 		}
 		err := wsjson.Read(readCtx, c, &env)
 		if rcancel != nil {
