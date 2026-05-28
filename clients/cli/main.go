@@ -36,6 +36,9 @@ const (
 // before being applied to the clipboard.
 const maxClipDownload = 64 << 20 // 64 MiB
 
+// cliToken is the auth token for HTTP upload/download, set once in main.
+var cliToken string
+
 func fatalf(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(code)
@@ -102,6 +105,9 @@ func uploadFile(ctx context.Context, httpBase, path, contentType string) (upload
 		return "", 0, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	if cliToken != "" {
+		req.Header.Set("Authorization", "Bearer "+cliToken)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -172,6 +178,9 @@ func runRecvApply(ctx context.Context, c *websocket.Conn, wsAddr string, markRem
 				u := strings.TrimRight(base, "/") + cl.UploadURL
 				dctx, dcancel := context.WithTimeout(ctx, 30*time.Second)
 				req, _ := http.NewRequestWithContext(dctx, http.MethodGet, u, nil)
+				if cliToken != "" {
+					req.Header.Set("Authorization", "Bearer "+cliToken)
+				}
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					dcancel()
@@ -490,6 +499,7 @@ func main() {
 	poll := flag.Int("poll-ms", 400, "clipboard poll interval for watch/sync")
 	verbose := flag.Bool("v", false, "verbose logging (debug)")
 	flag.Parse()
+	cliToken = *token
 
 	switch *mode {
 	case "listen":

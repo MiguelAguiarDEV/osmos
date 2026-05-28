@@ -21,6 +21,9 @@ type UploadServer struct {
 	MaxBytes int64
 	Allowed  []string      // whitelist de mimes permitidos; vacío = desactivado
 	TTL      time.Duration // borra blobs más viejos que esto; 0 = desactivado
+	// Auth validates the bearer token; if nil, no authentication is enforced
+	// (kept for tests/back-compat). When set, /upload and /d/{id} require it.
+	Auth func(token string) (userID string, ok bool)
 }
 
 type uploadResp struct {
@@ -30,7 +33,25 @@ type uploadResp struct {
 
 var idRe = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
+// authed reports whether the request carries a valid bearer token. When no Auth
+// is configured it always passes.
+func (s *UploadServer) authed(r *http.Request) bool {
+	if s.Auth == nil {
+		return true
+	}
+	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if tok == "" {
+		return false
+	}
+	_, ok := s.Auth(tok)
+	return ok
+}
+
 func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if s.MaxBytes > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBytes)
 	}
@@ -103,6 +124,10 @@ func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *UploadServer) Download(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	id := r.PathValue("id")
 	if !idRe.MatchString(id) {
 		http.NotFound(w, r)

@@ -35,18 +35,20 @@ func NewApp() *App {
     if lvl := os.Getenv("CLIPSYNC_LOG_LEVEL"); lvl != "" {
         logx.SetLevel(lvl)
     }
-    wss := &ws.Server{
-        Auth: func(token string) (string, bool) {
-            secret := os.Getenv("CLIPSYNC_HMAC_SECRET")
-            if secret == "" {
-                if token == "" {
-                    return "", false
-                }
-                // modo MVP: token == userID
-                return token, true
+    // Shared authentication: MVP (token == userID) or HMAC if a secret is set.
+    auth := func(token string) (string, bool) {
+        secret := os.Getenv("CLIPSYNC_HMAC_SECRET")
+        if secret == "" {
+            if token == "" {
+                return "", false
             }
-            return verifyHMACToken(token, secret)
-        },
+            // modo MVP: token == userID
+            return token, true
+        }
+        return verifyHMACToken(token, secret)
+    }
+    wss := &ws.Server{
+        Auth:               auth,
         MaxInlineBytes:     envInt("CLIPSYNC_INLINE_MAXBYTES", 64<<10),
         RateLimitPerSecond: envInt("CLIPSYNC_RATE_LPS", 0),
         Log: func(event string, fields map[string]any) {
@@ -63,6 +65,7 @@ func NewApp() *App {
         MaxBytes: int64(envInt("CLIPSYNC_UPLOAD_MAXBYTES", 50<<20)),
         Allowed:  splitCSV(envStr("CLIPSYNC_UPLOAD_ALLOWED", "")),
         TTL:      envDuration("CLIPSYNC_UPLOAD_TTL", 0),
+        Auth:     auth,
     }
     mux.HandleFunc("POST /upload", up.Upload)
     mux.HandleFunc("GET /d/{id}", up.Download)

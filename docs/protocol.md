@@ -88,6 +88,7 @@ Client dedupe (recommended):
 Stores a blob and returns a download URL.
 
 Request:
+- Header: `Authorization: Bearer <token>` (same token as `/ws`). Required.
 - Body: raw bytes.
 - Header: `Content-Type` validated against whitelist when configured.
 
@@ -95,6 +96,7 @@ Env/flags:
 - `CLIPSYNC_UPLOAD_DIR` or `--upload-dir` (default `./uploads`)
 - `CLIPSYNC_UPLOAD_MAXBYTES` or `--upload-max-bytes` (default `50MiB`)
 - `CLIPSYNC_UPLOAD_ALLOWED` or `--upload-allowed` (comma‑separated MIME list, supports wildcards like `image/*`). Empty disables whitelist.
+- `CLIPSYNC_UPLOAD_TTL` or `--upload-ttl` (e.g. `24h`, default `0` = keep forever): delete blobs older than this.
 
 Response:
 
@@ -104,6 +106,7 @@ Response:
 
 Status codes:
 - 200 OK: stored.
+- 401 Unauthorized: missing/invalid token.
 - 413 Payload Too Large: exceeds `MaxBytes`.
 - 415 Unsupported Media Type: MIME not in whitelist.
 - 5xx: storage or I/O errors.
@@ -111,7 +114,9 @@ Status codes:
 <a id="get-d"></a>
 ### GET /d/{id}
 
-Streams the stored blob with `Content-Type: application/octet-stream`.
+Streams the stored blob with `Content-Type: application/octet-stream`. Requires
+`Authorization: Bearer <token>`; returns 401 without a valid token and 404 for
+an unknown id.
 
 <a id="get-health"></a>
 ### GET /health
