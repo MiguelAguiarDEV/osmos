@@ -400,6 +400,19 @@ func keepAlive(ctx context.Context, c *websocket.Conn, cancel context.CancelFunc
 	}
 }
 
+// drainReads consumes and discards incoming messages. Needed when a mode only
+// writes (watch): without an active reader, coder/websocket never processes
+// PONG frames (so keep-alive would falsely time out) and the server's write
+// buffer to this client would back up. Cancels when the connection errors.
+func drainReads(ctx context.Context, c *websocket.Conn, cancel context.CancelFunc) {
+	for {
+		if _, _, err := c.Read(ctx); err != nil {
+			cancel()
+			return
+		}
+	}
+}
+
 // runWithReconnect keeps a long-running session alive: dial, run fn until it
 // returns (connection lost), then reconnect with exponential backoff. fn gets a
 // context cancelled when keep-alive detects a dead connection.
@@ -414,14 +427,24 @@ func runWithReconnect(addr, token, device string, fn func(ctx context.Context, c
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "connected to %s as %s\n", addr, device)
-		attempt = 0 // reset backoff after a successful connect
 		connCtx, connCancel := context.WithCancel(context.Background())
 		go keepAlive(connCtx, c, connCancel)
+		start := time.Now()
 		err = fn(connCtx, c)
 		connCancel()
 		_ = c.Close(websocket.StatusNormalClosure, "")
+		// Permanent rejection (bad token, expired HMAC, invalid device_id): stop
+		// instead of reconnecting forever and hammering the server.
+		if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
+			fatalf(exitConn, "rejected by server: %v", err)
+		}
 		if err != nil && connCtx.Err() == nil {
 			fmt.Fprintln(os.Stderr, "session ended:", err)
+		}
+		// Only reset the backoff if the session was actually healthy for a while;
+		// otherwise instant-fail sessions would reconnect in a tight loop.
+		if time.Since(start) >= 5*time.Second {
+			attempt = 0
 		}
 		sleepBackoff(attempt)
 	}
@@ -515,6 +538,11 @@ func main() {
 		getLR := func() string { mu.Lock(); defer mu.Unlock(); return lr }
 		clearLR := func() { mu.Lock(); lr = ""; mu.Unlock() }
 		runWithReconnect(*addr, *token, *device, func(ctx context.Context, c *websocket.Conn) error {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			// Drain incoming so PONGs are processed (keep-alive) and broadcasts
+			// from other devices don't back up on the server.
+			go drainReads(ctx, c, cancel)
 			return runWatchLoop(ctx, c, *addr, time.Duration(*poll)*time.Millisecond, getLR, clearLR, *verbose)
 		})
 
