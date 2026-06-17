@@ -39,10 +39,9 @@ go -C clients/cli test ./...
 - Error messages should be concise and actionable.
 - Logs are structured JSON in the server; avoid noisy logs.
 
-## Benchmarks and fuzzing
+## Fuzzing
 
-- Server hub includes lightweight fan‑out benchmarks (not executed by default in CI).
-- Fuzz test for the JSON Envelope exists; feel free to add seeds or invariants.
+- A fuzz test for the JSON Envelope exists; feel free to add seeds or invariants.
 
 ## Releases
 

@@ -42,12 +42,12 @@ Clip-Sync is a lightweight CLI to sync your clipboard across Windows and Linux, 
 
 ### Server on Windows
 
-**Option 1: Using prebuilt binary (recommended)**
+**Option 1: Using a prebuilt binary**
 
-1) Run the server (PowerShell):
+1) Download `server_windows_amd64.exe` from [Releases](https://github.com/MiguelAguiarDEV/osmos/releases), then run it (PowerShell):
 
 ```powershell
-.\dist\server_windows_amd64.exe --addr :8080
+.\server_windows_amd64.exe --addr :8080
 ```
 
 2) Open the firewall (admin):
@@ -66,13 +66,13 @@ go -C server run ./cmd/server --addr :8080
 
 ### Server on Linux
 
-**Option 1: Using prebuilt binary (recommended)**
+**Option 1: Using a prebuilt binary**
 
-1) Run the server:
+1) Download `server_linux_amd64` from [Releases](https://github.com/MiguelAguiarDEV/osmos/releases), then run it:
 
 ```bash
-chmod +x ./dist/server_linux_amd64
-./dist/server_linux_amd64 --addr 0.0.0.0:8080
+chmod +x ./server_linux_amd64
+./server_linux_amd64 --addr 0.0.0.0:8080
 ```
 
 2) Open the port (UFW or equivalent):
@@ -91,6 +91,8 @@ go -C server run ./cmd/server --addr 0.0.0.0:8080
 
 ## Clients
 
+Download the CLI for your platform from [Releases](https://github.com/MiguelAguiarDEV/osmos/releases), or build it with `make build` (binary at `bin/cli`).
+
 **Important:** Use the same `--token` for all devices of the same user, and a unique `--device` ID per machine.
 
 > **Note:** Replace `<SERVER_IP>` with your server's IP address (e.g., `192.168.1.100` for LAN or your public IP for Internet).
@@ -102,23 +104,23 @@ go -C server run ./cmd/server --addr 0.0.0.0:8080
 **Bidirectional sync** (recommended for most users):
 
 ```powershell
-.\dist\cli_windows_amd64.exe --mode sync --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1 -v
+.\cli_windows_amd64.exe --mode sync --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1 -v
 ```
 
 **Receive only** (apply incoming clipboard changes):
 
 ```powershell
-.\dist\cli_windows_amd64.exe --mode recv --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1 -v
+.\cli_windows_amd64.exe --mode recv --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1 -v
 ```
 
 **One-shot send** (text or file):
 
 ```powershell
 # Send text
-.\dist\cli_windows_amd64.exe --mode send --text "hello" --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1
+.\cli_windows_amd64.exe --mode send --text "hello" --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1
 
 # Send file
-.\dist\cli_windows_amd64.exe --mode send --file .\photo.png --mime image/png --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1
+.\cli_windows_amd64.exe --mode send --file .\photo.png --mime image/png --addr ws://<SERVER_IP>:8080/ws --token u1 --device W1
 ```
 
 <a id="linux"></a>
@@ -128,35 +130,39 @@ go -C server run ./cmd/server --addr 0.0.0.0:8080
 **Bidirectional sync** (recommended for most users):
 
 ```bash
-chmod +x ./dist/cli_linux_amd64
-./dist/cli_linux_amd64 --mode sync --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1 -v
+chmod +x ./cli_linux_amd64
+./cli_linux_amd64 --mode sync --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1 -v
 ```
 
 **Receive only** (apply incoming clipboard changes):
 
 ```bash
-./dist/cli_linux_amd64 --mode recv --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1 -v
+./cli_linux_amd64 --mode recv --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1 -v
 ```
 
 **One-shot send** (text or file):
 
 ```bash
 # Send text from stdin
-echo "hello" | ./dist/cli_linux_amd64 --mode send --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1
+echo "hello" | ./cli_linux_amd64 --mode send --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1
 
 # Send file
-./dist/cli_linux_amd64 --mode send --file ./photo.png --mime image/png --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1
+./cli_linux_amd64 --mode send --file ./photo.png --mime image/png --addr ws://<SERVER_IP>:8080/ws --token u1 --device L1
 ```
 
 <a id="releases"></a>
 
 ## Releases
 
-Prebuilt binaries for Windows and Linux are available in the [`dist/`](dist/) directory:
-* **Windows:** `dist/server_windows_amd64.exe` and `dist/cli_windows_amd64.exe`
-* **Linux:** `dist/server_linux_amd64` and `dist/cli_linux_amd64`
+Prebuilt binaries for Linux, Windows and macOS (amd64/arm64) are published on the
+[Releases](https://github.com/MiguelAguiarDEV/osmos/releases) page, built by the
+release workflow when a `vX.Y.Z` tag is pushed.
 
-You can also build locally from source using `make dist` or the scripts under [`scripts/`](scripts/).
+To build locally instead:
+
+```bash
+make build   # server -> bin/server, cli -> bin/cli
+```
 
 <a id="configuration"></a>
 
@@ -165,17 +171,39 @@ You can also build locally from source using `make dist` or the scripts under [`
 * `--addr` (`CLIPSYNC_ADDR`): listen address (default `:8080`).
 * `--inline-max-bytes` (`CLIPSYNC_INLINE_MAXBYTES`): inline size limit (default 64 KiB).
 * `--upload-dir`, `--upload-max-bytes`, `--upload-allowed`: upload directory, max size, allowed MIME whitelist (supports wildcards like `image/*`).
+* `--upload-ttl` (`CLIPSYNC_UPLOAD_TTL`): delete uploaded blobs older than this duration, e.g. `24h` (default `0`, disabled).
+* `--rate-lps` (`CLIPSYNC_RATE_LPS`): per‑device clip rate limit per second (default `100`; `0` disables).
+* `--redis-url` (`CLIPSYNC_REDIS_URL`): Redis URL (e.g. `redis://host:6379/0`) to fan out across multiple server instances. Empty = single instance. See [Scaling](#scaling).
+* `--redis-channel` (`CLIPSYNC_REDIS_CHANNEL`): Redis pub/sub channel (default `clipsync`).
 * `--log-level` (`CLIPSYNC_LOG_LEVEL`): `debug|info|error|off`.
-* Optional security (HMAC): set `CLIPSYNC_HMAC_SECRET`. Token: `user:exp_unix:hex(hmac_sha256(secret, user|exp))`.
+* Auth: all of `/ws`, `/upload` and `/d/{id}` require the token. Optional HMAC: set `CLIPSYNC_HMAC_SECRET`; token format `user:exp_unix:hex(hmac_sha256(secret, user|exp))`.
 * TLS: use a reverse proxy (e.g., Caddy/Nginx) and connect via `wss://.../ws`.
+
+<a id="scaling"></a>
+
+## Scaling
+
+A single instance keeps connections in memory and fans clips out locally — no
+extra setup needed. To run **multiple instances** behind a load balancer (so a
+user's devices can land on any instance), point them all at the same Redis:
+
+```bash
+./server_linux_amd64 --addr 0.0.0.0:8080 --redis-url redis://10.0.0.5:6379/0
+```
+
+Each instance publishes clips to a shared Redis channel and delivers received
+clips to its own connected devices. Uploaded blobs are written to `--upload-dir`,
+so for multi-instance use put that on shared storage (or a shared object store)
+reachable by every instance. If Redis is unreachable at startup the instance
+logs an error and falls back to single-instance mode.
 
 <a id="technical-specs"></a>
 
 ## Technical Specs
 
-* Stack: Go 1.22, WebSocket (`/ws`) + HTTP (`/upload`, `/d/{id}`, `/health`, `/healthz`).
-* Architecture: per‑user hub with fan‑out to devices; no echo to sender.
-* Scalability: client exponential backoff; dedup by `msg_id` on server and client.
+* Stack: Go 1.24, WebSocket (`/ws`) + HTTP (`/upload`, `/d/{id}`, `/health`, `/healthz`).
+* Architecture: per‑user fan‑out to devices; no echo to sender. Optional Redis pub/sub for multi‑instance fan‑out.
+* Scalability: client exponential backoff; dedup by `msg_id` on server and client; horizontal scale‑out via Redis.
 * Clipboard backends:
   * Windows: `clip.exe` or PowerShell (`Get-Clipboard` / `Set-Clipboard`).
   * Linux: Wayland `wl-clipboard` or X11 `xclip` / `xsel`.
@@ -195,8 +223,7 @@ You can also build locally from source using `make dist` or the scripts under [`
 │  ├─ internal/
 │  │  ├─ app               # HTTP mux (routes: /health, /healthz, /ws, /upload, /d/{id})
 │  │  ├─ httpapi           # upload/download
-│  │  ├─ hub               # pub/sub (fan-out)
-│  │  └─ ws                # WebSocket handler
+│  │  └─ ws                # WebSocket handler (per-user fan-out)
 │  ├─ pkg/types            # envelopes
 │  └─ tests                # integration/E2E
 └─ clients/cli/            # Go module: CLI

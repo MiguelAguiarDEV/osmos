@@ -1,23 +1,31 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type UploadServer struct {
 	Dir      string
 	MaxBytes int64
-	Allowed  []string // whitelist de mimes permitidos; vacío = desactivado
+	Allowed  []string      // whitelist de mimes permitidos; vacío = desactivado
+	TTL      time.Duration // borra blobs más viejos que esto; 0 = desactivado
+	// Auth validates the bearer token; if nil, no authentication is enforced
+	// (kept for tests/back-compat). When set, /upload and /d/{id} require it.
+	Auth func(token string) (userID string, ok bool)
 }
 
 type uploadResp struct {
@@ -27,11 +35,39 @@ type uploadResp struct {
 
 var idRe = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
+// userDir returns the storage directory for the request's authenticated user
+// and whether the request is authorized. Blobs live under a per-user namespace
+// so one user can't fetch another's blob even if they learn its id. With no
+// Auth configured it falls back to the flat directory (tests/back-compat).
+func (s *UploadServer) userDir(r *http.Request) (string, bool) {
+	if s.Auth == nil {
+		return s.Dir, true
+	}
+	tok := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(tok) >= 7 && strings.EqualFold(tok[:7], "Bearer ") {
+		tok = strings.TrimSpace(tok[7:])
+	}
+	if tok == "" {
+		return "", false
+	}
+	uid, ok := s.Auth(tok)
+	if !ok || uid == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return filepath.Join(s.Dir, hex.EncodeToString(sum[:])), true
+}
+
 func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
+	dir, ok := s.userDir(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if s.MaxBytes > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBytes)
 	}
-	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
@@ -52,10 +88,10 @@ func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := randHex(16)
-	final := filepath.Join(s.Dir, id)
+	final := filepath.Join(dir, id)
 
 	// escribir a tmp y luego rename
-	tmp, err := os.CreateTemp(s.Dir, ".upload-*")
+	tmp, err := os.CreateTemp(dir, ".upload-*")
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
@@ -100,12 +136,17 @@ func (s *UploadServer) Upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *UploadServer) Download(w http.ResponseWriter, r *http.Request) {
+	dir, ok := s.userDir(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	id := r.PathValue("id")
 	if !idRe.MatchString(id) {
 		http.NotFound(w, r)
 		return
 	}
-	fp := filepath.Join(s.Dir, id)
+	fp := filepath.Join(dir, id)
 	f, err := os.Open(fp)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -126,6 +167,54 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// StartJanitor runs cleanup every interval until ctx is done. No-op if TTL<=0.
+func (s *UploadServer) StartJanitor(ctx context.Context, interval time.Duration) {
+	if s.TTL <= 0 || interval <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.cleanup(time.Now())
+			}
+		}
+	}()
+}
+
+// cleanup removes stored blobs and stale temp files older than TTL. It walks
+// recursively so per-user namespace subdirectories are covered too.
+func (s *UploadServer) cleanup(now time.Time) int {
+	if s.TTL <= 0 {
+		return 0
+	}
+	removed := 0
+	_ = filepath.WalkDir(s.Dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !idRe.MatchString(name) && !strings.HasPrefix(name, ".upload-") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if now.Sub(info.ModTime()) > s.TTL {
+			if os.Remove(path) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	return removed
 }
 
 func isAllowedMime(allowed []string, ct string) bool {

@@ -2,14 +2,15 @@ package ws
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
-    "regexp"
-    "strings"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"clip-sync/server/internal/hub"
+	"clip-sync/server/internal/broker"
 	"clip-sync/server/pkg/types"
 
 	"github.com/coder/websocket"
@@ -81,13 +82,20 @@ func (d *dedupeCache) ExistsOrAdd(id string) bool {
 }
 
 type Server struct {
-	Hub                *hub.Hub
 	Auth               func(token string) (string, bool)
 	MaxInlineBytes     int
 	RateLimitPerSecond int
 
+	// helloTimeout bounds how long an unauthenticated connection may stay open
+	// before sending a valid hello (0 = defaultHelloTimeout).
+	helloTimeout time.Duration
+
 	// logger: si es nil, no loggea
 	Log func(event string, fields map[string]any)
+
+	// broker fans clips out (Local by default; Redis for multi-instance).
+	broker     broker.Broker
+	brokerOnce sync.Once
 
 	mu    sync.RWMutex
 	conns map[string]map[string]*websocket.Conn // userID -> deviceID -> conn
@@ -105,11 +113,13 @@ type Server struct {
 	}
 
 	// backpressure visible: drops por device (userID|deviceID)
-	dropsMu        sync.Mutex
-	dropsByDevice  map[string]int64
+	dropsMu       sync.Mutex
+	dropsByDevice map[string]int64
 }
 
 var deviceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+const defaultHelloTimeout = 10 * time.Second
 
 func (s *Server) SetDedupeCapacity(n int) {
 	s.ddmu.Lock()
@@ -129,9 +139,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	c.SetReadLimit(types.WSReadLimit(s.MaxInlineBytes))
 	defer c.Close(websocket.StatusNormalClosure, "")
 
+	pingCtx, pingCancel := context.WithCancel(r.Context())
+	defer pingCancel()
+
 	var userID, deviceID string
+	pingerStarted := false
+	// Absolute deadline for completing authentication. Using a fixed deadline
+	// (not a per-read timeout) means a client can't keep an unauthenticated
+	// connection alive forever by dribbling junk messages.
+	hto := s.helloTimeout
+	if hto <= 0 {
+		hto = defaultHelloTimeout
+	}
+	authDeadline := time.Now().Add(hto)
 
 	s.mu.Lock()
 	if s.conns == nil {
@@ -141,9 +164,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		var env types.Envelope
-		if err := wsjson.Read(r.Context(), c, &env); err != nil {
+		// Until authenticated, bound the read so connections that upgrade but
+		// never send a valid hello can't pile up (slowloris). Afterwards the
+		// pinger handles liveness.
+		readCtx := r.Context()
+		var rcancel context.CancelFunc
+		if userID == "" {
+			readCtx, rcancel = context.WithDeadline(r.Context(), authDeadline)
+		}
+		err := wsjson.Read(readCtx, c, &env)
+		if rcancel != nil {
+			rcancel()
+		}
+		if err != nil {
 			if userID != "" && deviceID != "" {
-				s.removeConn(userID, deviceID)
+				s.removeConn(userID, deviceID, c)
 			}
 			return
 		}
@@ -154,22 +189,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			tok := env.Hello.Token
-			uid := env.Hello.UserID
-			dev := env.Hello.DeviceID
-            dev = strings.TrimSpace(dev)
-            if !deviceIDRe.MatchString(dev) {
-                _ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
-                return
-            }
+			uid := strings.TrimSpace(env.Hello.UserID)
+			dev := strings.TrimSpace(env.Hello.DeviceID)
+			if !deviceIDRe.MatchString(dev) {
+				_ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
+				return
+			}
 			if s.Auth != nil {
-				if got, ok := s.Auth(tok); !ok || (uid != "" && got != uid) {
+				got, ok := s.Auth(tok)
+				if !ok {
 					_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
 					return
 				}
+				// The authenticated identity is authoritative; the client-provided
+				// user_id is only a hint (the CLI sends the full token there).
+				uid = got
+			}
+			if uid == "" {
+				_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
+				return
 			}
 			userID, deviceID = uid, dev
-			s.addConn(uid, dev, c)
-			s.log("ws_hello", map[string]any{"user_id": uid, "device_id": dev})
+			s.addConn(userID, deviceID, c)
+			if !pingerStarted {
+				pingerStarted = true
+				go s.pinger(pingCtx, c)
+			}
+			s.log("ws_hello", map[string]any{"user_id": userID, "device_id": deviceID})
 
 		case "clip":
 			if env.Clip == nil {
@@ -207,7 +253,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				From: deviceID,
 				Clip: clip,
 			}
-			s.broadcast(userID, deviceID, out)
+			if payload, err := json.Marshal(out); err == nil {
+				s.publish(userID, deviceID, payload)
+			}
 			s.log("ws_clip", map[string]any{
 				"user_id": userID, "device_id": deviceID, "msg_id": clip.MsgID,
 				"mime": clip.Mime, "size": clip.Size, "has_data": len(clip.Data) > 0,
@@ -256,66 +304,139 @@ func (s *Server) allow(userID, deviceID string) bool {
 	return lim.allow()
 }
 
+// pinger keeps a client connection liveness-checked: a failed ping (dead or
+// half-open client) closes the connection so the read loop ends and the conn is
+// removed, instead of lingering and stalling every broadcast on a 1s timeout.
+func (s *Server) pinger(ctx context.Context, c *websocket.Conn) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := c.Ping(pctx)
+			cancel()
+			if err != nil {
+				_ = c.Close(websocket.StatusGoingAway, "ping timeout")
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) addConn(userID, deviceID string, c *websocket.Conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.conns[userID] == nil {
 		s.conns[userID] = make(map[string]*websocket.Conn)
 	}
+	old := s.conns[userID][deviceID]
 	s.conns[userID][deviceID] = c
-	atomic.AddInt64(&s.metrics.conns, 1)
+	if old == nil {
+		atomic.AddInt64(&s.metrics.conns, 1)
+	}
+	s.mu.Unlock()
+	// A device_id is single-connection: the newest wins. Close any prior
+	// connection for this device so its read loop ends (its removeConn is a
+	// no-op thanks to the identity check below). Done outside the lock.
+	if old != nil && old != c {
+		_ = old.Close(websocket.StatusPolicyViolation, "replaced by new connection")
+	}
 }
 
-func (s *Server) removeConn(userID, deviceID string) {
+func (s *Server) removeConn(userID, deviceID string, c *websocket.Conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	removed := false
 	if m := s.conns[userID]; m != nil {
-		if _, ok := m[deviceID]; ok {
+		// Only remove if the stored connection is the one leaving; otherwise a
+		// stale old connection would evict the live reconnected one.
+		if cur, ok := m[deviceID]; ok && cur == c {
 			delete(m, deviceID)
 			atomic.AddInt64(&s.metrics.conns, -1)
+			removed = true
 		}
 		if len(m) == 0 {
 			delete(s.conns, userID)
 		}
 	}
+	_, roomAlive := s.conns[userID]
+	s.mu.Unlock()
+
+	if !removed {
+		return
+	}
+	// Free per-device/per-user state so these maps don't grow without bound as
+	// devices churn. Only runs when the leaving conn was the live one.
+	key := userID + "|" + deviceID
+	s.rlmu.Lock()
+	delete(s.rl, key)
+	s.rlmu.Unlock()
+	s.dropsMu.Lock()
+	delete(s.dropsByDevice, key)
+	s.dropsMu.Unlock()
+	if !roomAlive {
+		s.ddmu.Lock()
+		delete(s.dd, userID)
+		s.ddmu.Unlock()
+	}
 }
 
-func (s *Server) broadcast(userID, fromDevice string, env types.Envelope) {
-	buildTargets := func() [][2]interface{} {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		list := make([][2]interface{}, 0, 4)
-		if peers := s.conns[userID]; peers != nil {
-			for dev, c := range peers {
-				if dev == fromDevice {
-					continue
-				}
-				list = append(list, [2]interface{}{dev, c})
+// SetBroker wires a fan-out broker (e.g. Redis for multi-instance). If never
+// called, a Local broker is used on first publish.
+func (s *Server) SetBroker(b broker.Broker) {
+	s.brokerOnce.Do(func() {
+		s.broker = b
+		b.SetHandler(s.deliverLocal)
+	})
+}
+
+// publish hands the marshalled clip to the broker, which delivers it to every
+// instance's local connections (including this one) via deliverLocal.
+func (s *Server) publish(userID, fromDevice string, payload []byte) {
+	s.SetBroker(broker.NewLocal()) // no-op if a broker is already set
+	s.broker.Publish(userID, fromDevice, payload)
+}
+
+type target struct {
+	dev string
+	c   *websocket.Conn
+}
+
+// deliverLocal writes payload to this instance's connections for userID,
+// skipping fromDevice, and returns the number of local recipients. Peers are
+// written in parallel so one slow peer can't delay the others.
+func (s *Server) deliverLocal(userID, fromDevice string, payload []byte) int {
+	s.mu.RLock()
+	var targets []target
+	if peers := s.conns[userID]; peers != nil {
+		targets = make([]target, 0, len(peers))
+		for dev, c := range peers {
+			if dev != fromDevice {
+				targets = append(targets, target{dev, c})
 			}
 		}
-		return list
 	}
+	s.mu.RUnlock()
 
-	targets := buildTargets()
-	if len(targets) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		targets = buildTargets()
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func(dev string, c *websocket.Conn) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			if err := c.Write(ctx, websocket.MessageText, payload); err != nil {
+				atomic.AddInt64(&s.metrics.drops, 1)
+				s.incDeviceDrop(userID, dev)
+				s.log("ws_drop_backpressure", map[string]any{
+					"user_id": userID, "device_id": dev, "error": err.Error(),
+				})
+			}
+		}(t.dev, t.c)
 	}
-
-	for _, pair := range targets {
-		dev := pair[0].(string)
-		c := pair[1].(*websocket.Conn)
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		if err := wsjson.Write(ctx, c, env); err != nil {
-			// contar como drop por backpressure/error de escritura
-			atomic.AddInt64(&s.metrics.drops, 1)
-			s.incDeviceDrop(userID, dev)
-			s.log("ws_drop_backpressure", map[string]any{
-				"user_id": userID, "device_id": dev, "error": err.Error(),
-			})
-		}
-		cancel()
-	}
+	wg.Wait()
+	return len(targets)
 }
 
 func (s *Server) incDeviceDrop(userID, deviceID string) {
@@ -356,6 +477,9 @@ func (s *Server) MetricsSnapshot() map[string]int64 {
 		"drops_total":   atomic.LoadInt64(&s.metrics.drops),
 		"conns_current": atomic.LoadInt64(&s.metrics.conns),
 	}
+	s.mu.RLock()
+	m["users_current"] = int64(len(s.conns))
+	s.mu.RUnlock()
 	// incluir drops por device de forma plana, para mantener tipo map[string]int64
 	s.dropsMu.Lock()
 	for k, v := range s.dropsByDevice {

@@ -13,15 +13,16 @@ import (
     "strings"
     "time"
 
+    "clip-sync/server/internal/broker"
     "clip-sync/server/internal/httpapi"
-    "clip-sync/server/internal/hub"
     "clip-sync/server/internal/logx"
     "clip-sync/server/internal/ws"
 )
 
 type App struct {
-	Mux *http.ServeMux
-	WSS *ws.Server
+	Mux     *http.ServeMux
+	WSS     *ws.Server
+	Uploads *httpapi.UploadServer
 }
 
 func NewApp() *App {
@@ -31,26 +32,29 @@ func NewApp() *App {
         w.Write([]byte("ok"))
     })
 
-    h := hub.New(32)
     // configurar nivel de logs
     if lvl := os.Getenv("CLIPSYNC_LOG_LEVEL"); lvl != "" {
         logx.SetLevel(lvl)
     }
-    wss := &ws.Server{
-        Hub: h,
-        Auth: func(token string) (string, bool) {
-            secret := os.Getenv("CLIPSYNC_HMAC_SECRET")
-            if secret == "" {
-                if token == "" {
-                    return "", false
-                }
-                // modo MVP: token == userID
-                return token, true
+    // Shared authentication: MVP (token == userID) or HMAC if a secret is set.
+    auth := func(token string) (string, bool) {
+        secret := os.Getenv("CLIPSYNC_HMAC_SECRET")
+        if secret == "" {
+            if token == "" {
+                return "", false
             }
-            return verifyHMACToken(token, secret)
-        },
+            // modo MVP: token == userID
+            return token, true
+        }
+        return verifyHMACToken(token, secret)
+    }
+    wss := &ws.Server{
+        Auth:               auth,
         MaxInlineBytes:     envInt("CLIPSYNC_INLINE_MAXBYTES", 64<<10),
-        RateLimitPerSecond: envInt("CLIPSYNC_RATE_LPS", 0),
+        // Generous per-device cap: real clipboard traffic is well under this
+        // (watch polls a few times/sec), but it bounds a pathological flood.
+        // Set CLIPSYNC_RATE_LPS=0 / --rate-lps 0 to disable.
+        RateLimitPerSecond: envInt("CLIPSYNC_RATE_LPS", 100),
         Log: func(event string, fields map[string]any) {
             logx.Info(event, fields)
         },
@@ -58,12 +62,27 @@ func NewApp() *App {
 	// dedupe: capacidad LRU por usuario desde env (0 = off)
 	wss.SetDedupeCapacity(envInt("CLIPSYNC_DEDUPE", 128))
 
+	// fan-out broker: Redis for multi-instance, else single-instance Local.
+	if url := os.Getenv("CLIPSYNC_REDIS_URL"); url != "" {
+		if rb, err := broker.NewRedis(url, envStr("CLIPSYNC_REDIS_CHANNEL", "clipsync")); err != nil {
+			logx.Error("redis_broker_init_failed", map[string]any{"error": err.Error(), "fallback": "local"})
+			wss.SetBroker(broker.NewLocal())
+		} else {
+			logx.Info("redis_broker", map[string]any{"channel": envStr("CLIPSYNC_REDIS_CHANNEL", "clipsync")})
+			wss.SetBroker(rb)
+		}
+	} else {
+		wss.SetBroker(broker.NewLocal())
+	}
+
 	mux.Handle("/ws", wss)
 
     up := &httpapi.UploadServer{
         Dir:      envStr("CLIPSYNC_UPLOAD_DIR", "./uploads"),
         MaxBytes: int64(envInt("CLIPSYNC_UPLOAD_MAXBYTES", 50<<20)),
         Allowed:  splitCSV(envStr("CLIPSYNC_UPLOAD_ALLOWED", "")),
+        TTL:      envDuration("CLIPSYNC_UPLOAD_TTL", 0),
+        Auth:     auth,
     }
     mux.HandleFunc("POST /upload", up.Upload)
     mux.HandleFunc("GET /d/{id}", up.Download)
@@ -85,7 +104,7 @@ func NewApp() *App {
 		_ = json.NewEncoder(w).Encode(wss.MetricsSnapshot())
 	})
 
-	return &App{Mux: mux, WSS: wss}
+	return &App{Mux: mux, WSS: wss, Uploads: up}
 }
 
 // Back-compat
@@ -109,6 +128,18 @@ func envStr(name, def string) string {
         return def
     }
     return v
+}
+
+func envDuration(name string, def time.Duration) time.Duration {
+    v := os.Getenv(name)
+    if v == "" {
+        return def
+    }
+    d, err := time.ParseDuration(v)
+    if err != nil {
+        return def
+    }
+    return d
 }
 
 func splitCSV(s string) []string {

@@ -27,7 +27,10 @@ func TestUploadAndSignal(t *testing.T) {
 
 	// 1) Upload ~100 KB
 	body := bytes.Repeat([]byte("X"), 100_000)
-	resp, err := http.Post(srv.URL+"/upload", "application/octet-stream", bytes.NewReader(body))
+	upReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/upload", bytes.NewReader(body))
+	upReq.Header.Set("Content-Type", "application/octet-stream")
+	upReq.Header.Set("Authorization", "Bearer u1")
+	resp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +104,9 @@ func TestUploadAndSignal(t *testing.T) {
 		t.Fatalf("size esperado=%d got=%d", len(body), got.Clip.Size)
 	}
 
-	dl, err := http.Get(srv.URL + got.Clip.UploadURL)
+	dlReq, _ := http.NewRequest(http.MethodGet, srv.URL+got.Clip.UploadURL, nil)
+	dlReq.Header.Set("Authorization", "Bearer u1")
+	dl, err := http.DefaultClient.Do(dlReq)
 	if err != nil {
 		t.Fatal(err)
 	}
