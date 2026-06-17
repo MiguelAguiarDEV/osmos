@@ -1,0 +1,12 @@
+.git
+.github
+bin/
+dist/
+**/uploads/
+docs/
+demos/
+clients/
+*.md
+TODO.md
+Makefile
+.gitignore
