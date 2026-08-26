@@ -43,13 +43,24 @@ Top‑level shape:
 ### Hello
 
 - `type`: `"hello"`
-- `hello.token`: authentication token.
-- `hello.user_id`: user identifier.
+- `hello.token`: authentication token. **This is the only source of identity.**
+- `hello.user_id`: informational only. The server derives the user from the
+  verified token and ignores this field, so a client cannot join another
+  user's room by declaring a different `user_id`.
 - `hello.device_id`: unique device id within the user namespace.
 
 Validation:
-- `device_id` must match `^[A-Za-z0-9_-]{1,64}$`.
-- If HMAC auth is enabled (`CLIPSYNC_HMAC_SECRET`), token must be `userID:exp_unix:hex(hmac_sha256(secret, userID|exp_unix))` and `exp_unix` must be in the future.
+- `device_id` must match `^[A-Za-z0-9_-]{1,64}$`. A malformed id closes the
+  connection with `1008 Policy Violation` / `invalid device_id`.
+- If HMAC auth is enabled (`CLIPSYNC_HMAC_SECRET`), token must be `userID:exp_unix:hex(hmac_sha256(secret, userID|exp_unix))` and `exp_unix` must be in the future. A bad or expired token closes with `1008` / `unauthorized`.
+- A `clip` received before a valid `hello` is dropped and counted.
+
+Duplicate device ids:
+- If a second connection sends `hello` with a `device_id` already in use for
+  that user, the **older** connection is closed with `1008` / `duplicate_device_id`.
+- Clients must treat `1008 Policy Violation` as terminal and **not** reconnect:
+  it signals a configuration error, and retrying makes two processes sharing a
+  `device_id` evict each other in an endless loop.
 
 <a id="clip"></a>
 ### Clip
@@ -66,6 +77,8 @@ Validation:
 Broadcast:
 - The server fans out the clip to all other devices of the same user.
 - The `from` field is set to the sender `device_id`.
+- Each receiving connection has its own bounded outbound queue, so a slow
+  device cannot stall delivery to the rest.
 
 Backpressure and rate limits:
 - Per‑device token bucket controlled by `CLIPSYNC_RATE_LPS`.
@@ -140,18 +153,35 @@ Auth:
 <a id="cli-behavior"></a>
 ## CLI behavior
 
-- `listen` mode: reconnects with exponential backoff, resets after success.
+- All long-running modes (`listen`, `recv`, `watch`, `sync`) reconnect with
+  exponential backoff (500 ms → 5 s), resetting after a successful connect.
+  They stop only on `1008 Policy Violation` or on SIGINT/SIGTERM.
+- `sync` runs receive and watch over the same connection; if either side
+  fails, both are torn down and the connection is re-established.
+- Clipboard text is canonicalised (CRLF → LF, no trailing newline) on both
+  read and apply. Without this, `Get-Clipboard` on Windows (which appends
+  CRLF) and `wl-paste -n` on Linux (which strips the trailing newline)
+  disagree about the same content and re-send it to each other forever.
 - `send` mode:
   - `--text` inline if ≤ MaxInlineBytes.
   - `--file` uploads to `/upload` with MIME auto‑detected by extension when not provided.
   - Stable pipe: when input is piped to stdin, reads up to MaxInlineBytes inline; otherwise spills to a temp file and uploads; MIME heuristic: valid UTF‑8 → `text/plain`, else `application/octet-stream`.
-- Exit codes: usage=2, connect=10, upload=11, send=12.
+  - `--text` is sent verbatim; leading/trailing whitespace is preserved.
+- The HTTP base for `/upload` and `/d/{id}` is derived from `--addr` by
+  replacing the scheme and **dropping the path**: `ws://host:8080/ws` →
+  `http://host:8080`.
+- Exit codes: usage=2, connect=10, upload=11, send=12, policy=13.
 
 <a id="limits"></a>
 ## Limits
 
 - `MaxInlineBytes` default 64 KiB. Change via env/flag.
 - Upload server `MaxBytes` default 50 MiB.
+- The WebSocket read limit is derived from `MaxInlineBytes` (`2×max + 4 KiB`)
+  because inline payloads travel base64-encoded inside the JSON envelope and
+  therefore expand by ~4/3. Custom clients must raise their own read limit the
+  same way; the 32 KiB default of most WebSocket libraries is not enough for a
+  64 KiB clip.
 
 <a id="observability"></a>
 ## Observability

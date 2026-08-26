@@ -35,8 +35,11 @@ Clip-Sync is a lightweight CLI to sync your clipboard across Windows and Linux, 
 ## Quick Start
 
 **Requirements:**
-* Prebuilt binaries (see [Releases](#releases)), or Go 1.22+ to build from source.
+* Go 1.23+ (see [Releases](#releases) to build the binaries), or the binaries in `dist/`.
 * TCP port `8080` reachable from clients.
+* A clipboard backend on the client for `recv`/`watch`/`sync`:
+  Linux `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11); Windows uses the
+  built-in `clip.exe`/PowerShell.
 
 <a id="server-on-windows"></a>
 
@@ -91,7 +94,7 @@ go -C server run ./cmd/server --addr 0.0.0.0:8080
 
 ## Clients
 
-**Important:** Use the same `--token` for all devices of the same user, and a unique `--device` ID per machine.
+**Important:** Use the same `--token` for all devices of the same user, and a unique `--device` ID per machine. Two clients sharing a `--device` value evict each other: the older session exits with `server rejected this session: duplicate_device_id` (exit code 13).
 
 > **Note:** Replace `<SERVER_IP>` with your server's IP address (e.g., `192.168.1.100` for LAN or your public IP for Internet).
 
@@ -152,11 +155,14 @@ echo "hello" | ./dist/cli_linux_amd64 --mode send --addr ws://<SERVER_IP>:8080/w
 
 ## Releases
 
-Prebuilt binaries for Windows and Linux are available in the [`dist/`](dist/) directory:
-* **Windows:** `dist/server_windows_amd64.exe` and `dist/cli_windows_amd64.exe`
-* **Linux:** `dist/server_linux_amd64` and `dist/cli_linux_amd64`
+Build the binaries for every supported platform with:
 
-You can also build locally from source using `make dist` or the scripts under [`scripts/`](scripts/).
+```bash
+make dist
+```
+
+This writes `dist/{server,cli}_{linux_amd64,windows_amd64.exe,darwin_arm64}`.
+For a local build of the current platform only, use `make build` (output in `bin/`).
 
 <a id="configuration"></a>
 
@@ -181,7 +187,8 @@ You can also build locally from source using `make dist` or the scripts under [`
   * Linux: Wayland `wl-clipboard` or X11 `xclip` / `xsel`.
 * Inline limit: 64 KiB. Large payloads via `/upload` (50 MiB default).
 * Observability: `/health` liveness, `/healthz` JSON metrics, optional `/debug/pprof/*` and `/debug/vars`.
-* Quality: unit + integration tests; GitHub Actions CI.
+* Quality: unit + integration tests run under `-race`; GitHub Actions CI checks gofmt, vet, tests and builds.
+* Resilience: every long-running client mode reconnects with exponential backoff, and stops only on a configuration error (bad token, duplicate `--device`) or SIGINT/SIGTERM.
 
 <a id="repository-layout"></a>
 
