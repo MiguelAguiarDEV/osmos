@@ -53,6 +53,33 @@
 
 ## Future Enhancements
 
+Interface
+- [ ] TUI for the client (connection status, device list, clip history, live log)
+- [ ] TUI for the server (connected devices, throughput, drops)
+- [ ] `osmos` single entry-point command with subcommands instead of `--mode`
+- [ ] Config file (`~/.config/osmos/config.toml`) so flags need not be retyped
+- [ ] Graphical user interface (GUI) for server and client
+
+Usability
 - [ ] Auto-configure server with default settings
 - [ ] Display local network IP + port on server startup for easy client connection
-- [ ] Graphical user interface (GUI) for server and client
+- [ ] Auto-generate a unique `--device` id from the hostname
+- [ ] `osmos doctor`: check clipboard backend, connectivity and firewall
+
+Sync capabilities
+- [ ] Sync non-text clips (images, files) in `recv`/`watch`, not just `text/*`
+- [ ] Clipboard history with the ability to re-apply a previous clip
+- [ ] Event-driven clipboard watching instead of polling every 400 ms
+
+Server
+- [ ] TTL / garbage collection for `/upload` blobs (they accumulate forever)
+- [ ] Native TLS (today it requires a reverse proxy)
+- [ ] End-to-end encryption so the server never sees clipboard contents
+- [ ] Persistence, so a device that was offline receives what it missed
+- [ ] Horizontal scale-out (the hub is in-process only)
+
+Packaging
+- [ ] Publish binaries as GitHub Releases artifacts instead of committing `dist/`
+- [ ] systemd units and a Windows service/startup entry
+- [ ] Packages: AUR, Homebrew, winget, Docker image
+- [ ] Align the module path and docs with the `osmos` repository name (both still say `clip-sync`)

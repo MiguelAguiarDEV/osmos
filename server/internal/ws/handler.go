@@ -3,8 +3,8 @@ package ws
 import (
 	"context"
 	"net/http"
-    "regexp"
-    "strings"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +19,7 @@ import (
 /* -------- rate limit -------- */
 
 type limiter struct {
+	mu       sync.Mutex
 	rate     float64
 	capacity float64
 	tokens   float64
@@ -35,6 +36,8 @@ func newLimiter(rps int) *limiter {
 }
 
 func (l *limiter) allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	now := time.Now()
 	el := now.Sub(l.last).Seconds()
 	l.last = now
@@ -80,6 +83,74 @@ func (d *dedupeCache) ExistsOrAdd(id string) bool {
 	return false
 }
 
+/* -------- conexión con cola de salida -------- */
+
+// outQueueSize acota cuántos clips pendientes se guardan por device antes de
+// empezar a descartar. Escribir directamente desde el goroutine lector deja
+// que un cliente lento bloquee a todos los demás, así que cada conexión tiene
+// su propio escritor.
+const outQueueSize = 64
+
+type conn struct {
+	ws      *websocket.Conn
+	out     chan []byte
+	done    chan struct{}
+	closeMu sync.Mutex
+	closed  bool
+	helloAt time.Time
+}
+
+func newConn(c *websocket.Conn) *conn {
+	return &conn{
+		ws:      c,
+		out:     make(chan []byte, outQueueSize),
+		done:    make(chan struct{}),
+		helloAt: time.Now(),
+	}
+}
+
+// enqueue devuelve false si la cola está llena (backpressure) o ya cerrada.
+func (c *conn) enqueue(payload []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.out <- payload:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *conn) stop() {
+	c.closeMu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.done)
+	}
+	c.closeMu.Unlock()
+}
+
+// writeLoop serializa las escrituras de una conexión y mantiene el orden.
+func (c *conn) writeLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case payload := <-c.out:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := c.ws.Write(ctx, websocket.MessageText, payload)
+			cancel()
+			if err != nil {
+				c.stop()
+				return
+			}
+		}
+	}
+}
+
 type Server struct {
 	Hub                *hub.Hub
 	Auth               func(token string) (string, bool)
@@ -90,7 +161,7 @@ type Server struct {
 	Log func(event string, fields map[string]any)
 
 	mu    sync.RWMutex
-	conns map[string]map[string]*websocket.Conn // userID -> deviceID -> conn
+	conns map[string]map[string]*conn // userID -> deviceID -> conn
 
 	rlmu sync.Mutex
 	rl   map[string]*limiter // key: userID|deviceID
@@ -105,8 +176,8 @@ type Server struct {
 	}
 
 	// backpressure visible: drops por device (userID|deviceID)
-	dropsMu        sync.Mutex
-	dropsByDevice  map[string]int64
+	dropsMu       sync.Mutex
+	dropsByDevice map[string]int64
 }
 
 var deviceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -124,27 +195,39 @@ func (s *Server) log(event string, fields map[string]any) {
 	}
 }
 
+// readLimit acota el tamaño de un mensaje entrante. Un clip inline viaja
+// como JSON con el payload en base64, así que necesita ~4/3 del tamaño
+// original más el resto del sobre.
+func (s *Server) readLimit() int64 {
+	max := s.MaxInlineBytes
+	if max <= 0 {
+		max = types.MaxInlineBytes
+	}
+	return int64(max)*2 + 4096
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 	if err != nil {
 		return
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
+	c.SetReadLimit(s.readLimit())
 
 	var userID, deviceID string
-
-	s.mu.Lock()
-	if s.conns == nil {
-		s.conns = make(map[string]map[string]*websocket.Conn)
-	}
-	s.mu.Unlock()
+	var self *conn
+	defer func() {
+		if self != nil {
+			self.stop()
+		}
+		if userID != "" && deviceID != "" {
+			s.removeConn(userID, deviceID, self)
+		}
+	}()
 
 	for {
 		var env types.Envelope
 		if err := wsjson.Read(r.Context(), c, &env); err != nil {
-			if userID != "" && deviceID != "" {
-				s.removeConn(userID, deviceID)
-			}
 			return
 		}
 
@@ -155,24 +238,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			tok := env.Hello.Token
 			uid := env.Hello.UserID
-			dev := env.Hello.DeviceID
-            dev = strings.TrimSpace(dev)
-            if !deviceIDRe.MatchString(dev) {
-                _ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
-                return
-            }
+			dev := strings.TrimSpace(env.Hello.DeviceID)
+			if !deviceIDRe.MatchString(dev) {
+				_ = c.Close(websocket.StatusPolicyViolation, "invalid device_id")
+				return
+			}
 			if s.Auth != nil {
-				if got, ok := s.Auth(tok); !ok || (uid != "" && got != uid) {
+				got, ok := s.Auth(tok)
+				if !ok {
 					_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
 					return
 				}
+				// el userID sale siempre del token verificado: el campo
+				// user_id del cliente es informativo y no se puede usar
+				// para entrar en la sala de otro usuario.
+				uid = got
+			}
+			if uid == "" {
+				_ = c.Close(websocket.StatusPolicyViolation, "unauthorized")
+				return
+			}
+			if self != nil && userID == uid && deviceID == dev {
+				// hello repetido sobre la misma conexión: nada que hacer
+				continue
+			}
+			if self != nil {
+				self.stop()
+				s.removeConn(userID, deviceID, self)
 			}
 			userID, deviceID = uid, dev
-			s.addConn(uid, dev, c)
+			self = newConn(c)
+			s.addConn(uid, dev, self)
+			go self.writeLoop()
 			s.log("ws_hello", map[string]any{"user_id": uid, "device_id": dev})
 
 		case "clip":
 			if env.Clip == nil {
+				continue
+			}
+			if self == nil {
+				// clip antes del hello: sin sala a la que enviarlo
+				atomic.AddInt64(&s.metrics.drops, 1)
+				s.log("ws_drop_no_hello", map[string]any{"msg_id": env.Clip.MsgID})
 				continue
 			}
 			clip := env.Clip
@@ -207,7 +314,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				From: deviceID,
 				Clip: clip,
 			}
-			s.broadcast(userID, deviceID, out)
+			s.broadcast(userID, deviceID, self, out)
 			s.log("ws_clip", map[string]any{
 				"user_id": userID, "device_id": deviceID, "msg_id": clip.MsgID,
 				"mime": clip.Mime, "size": clip.Size, "has_data": len(clip.Data) > 0,
@@ -221,10 +328,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) isDup(userID, msgID string) bool {
+	s.ddmu.Lock()
+	defer s.ddmu.Unlock()
 	if s.ddcap <= 0 || msgID == "" {
 		return false
 	}
-	s.ddmu.Lock()
 	if s.dd == nil {
 		s.dd = make(map[string]*dedupeCache)
 	}
@@ -233,9 +341,7 @@ func (s *Server) isDup(userID, msgID string) bool {
 		d = newDedupe(s.ddcap)
 		s.dd[userID] = d
 	}
-	hit := d.ExistsOrAdd(msgID)
-	s.ddmu.Unlock()
-	return hit
+	return d.ExistsOrAdd(msgID)
 }
 
 func (s *Server) allow(userID, deviceID string) bool {
@@ -256,65 +362,115 @@ func (s *Server) allow(userID, deviceID string) bool {
 	return lim.allow()
 }
 
-func (s *Server) addConn(userID, deviceID string, c *websocket.Conn) {
+func (s *Server) addConn(userID, deviceID string, c *conn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.conns == nil {
+		s.conns = make(map[string]map[string]*conn)
+	}
 	if s.conns[userID] == nil {
-		s.conns[userID] = make(map[string]*websocket.Conn)
+		s.conns[userID] = make(map[string]*conn)
 	}
+	prev := s.conns[userID][deviceID]
 	s.conns[userID][deviceID] = c
-	atomic.AddInt64(&s.metrics.conns, 1)
+	if prev == nil {
+		atomic.AddInt64(&s.metrics.conns, 1)
+	}
+	s.mu.Unlock()
+
+	if prev != nil && prev != c {
+		// mismo device_id reconectando: cerrar la sesión anterior.
+		// StatusPolicyViolation (y no un cierre normal) para que el cliente
+		// lo trate como error de configuración y NO reintente: si dos
+		// procesos comparten device_id y ambos reconectan, se echan
+		// mutuamente en bucle infinito.
+		prev.stop()
+		_ = prev.ws.Close(websocket.StatusPolicyViolation, "duplicate_device_id")
+	}
 }
 
-func (s *Server) removeConn(userID, deviceID string) {
+// removeConn sólo desregistra si la conexión guardada sigue siendo `c`.
+// Sin esta comprobación, el cierre tardío de una conexión vieja borraba del
+// registro a la conexión nueva del mismo device tras reconectar.
+func (s *Server) removeConn(userID, deviceID string, c *conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if m := s.conns[userID]; m != nil {
-		if _, ok := m[deviceID]; ok {
-			delete(m, deviceID)
-			atomic.AddInt64(&s.metrics.conns, -1)
-		}
-		if len(m) == 0 {
-			delete(s.conns, userID)
-		}
+	m := s.conns[userID]
+	if m == nil {
+		return
+	}
+	cur, ok := m[deviceID]
+	if !ok {
+		return
+	}
+	if c != nil && cur != c {
+		return
+	}
+	delete(m, deviceID)
+	atomic.AddInt64(&s.metrics.conns, -1)
+	if len(m) == 0 {
+		delete(s.conns, userID)
 	}
 }
 
-func (s *Server) broadcast(userID, fromDevice string, env types.Envelope) {
-	buildTargets := func() [][2]interface{} {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		list := make([][2]interface{}, 0, 4)
-		if peers := s.conns[userID]; peers != nil {
-			for dev, c := range peers {
-				if dev == fromDevice {
-					continue
-				}
-				list = append(list, [2]interface{}{dev, c})
-			}
+func (s *Server) peers(userID, fromDevice string) []*conn {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	room := s.conns[userID]
+	if len(room) == 0 {
+		return nil
+	}
+	list := make([]*conn, 0, len(room))
+	for dev, c := range room {
+		if dev == fromDevice {
+			continue
 		}
-		return list
+		list = append(list, c)
+	}
+	return list
+}
+
+func (s *Server) deviceOf(userID string, target *conn) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for dev, c := range s.conns[userID] {
+		if c == target {
+			return dev
+		}
+	}
+	return ""
+}
+
+// joinGrace es la ventana en la que un emisor recién conectado espera a que
+// aparezca algún peer. Cubre la carrera de "todos los devices arrancan a la
+// vez"; fuera de esa ventana el envío no bloquea nunca.
+const joinGrace = 300 * time.Millisecond
+
+func (s *Server) broadcast(userID, fromDevice string, from *conn, env types.Envelope) {
+	payload, err := marshalEnvelope(env)
+	if err != nil {
+		atomic.AddInt64(&s.metrics.drops, 1)
+		return
 	}
 
-	targets := buildTargets()
-	if len(targets) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		targets = buildTargets()
+	targets := s.peers(userID, fromDevice)
+	if len(targets) == 0 && from != nil && time.Since(from.helloAt) < joinGrace {
+		deadline := time.Now().Add(50 * time.Millisecond)
+		for len(targets) == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+			targets = s.peers(userID, fromDevice)
+		}
 	}
 
-	for _, pair := range targets {
-		dev := pair[0].(string)
-		c := pair[1].(*websocket.Conn)
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		if err := wsjson.Write(ctx, c, env); err != nil {
-			// contar como drop por backpressure/error de escritura
-			atomic.AddInt64(&s.metrics.drops, 1)
-			s.incDeviceDrop(userID, dev)
-			s.log("ws_drop_backpressure", map[string]any{
-				"user_id": userID, "device_id": dev, "error": err.Error(),
-			})
+	for _, c := range targets {
+		if c.enqueue(payload) {
+			continue
 		}
-		cancel()
+		atomic.AddInt64(&s.metrics.drops, 1)
+		dev := s.deviceOf(userID, c)
+		s.incDeviceDrop(userID, dev)
+		s.log("ws_drop_backpressure", map[string]any{
+			"user_id": userID, "device_id": dev, "error": "out queue full",
+		})
 	}
 }
 
@@ -368,18 +524,19 @@ func (s *Server) MetricsSnapshot() map[string]int64 {
 // Graceful shutdown
 func (s *Server) Shutdown(ctx context.Context) {
 	s.mu.Lock()
-	var list []*websocket.Conn
+	var list []*conn
 	for _, devs := range s.conns {
 		for _, c := range devs {
 			list = append(list, c)
 		}
 	}
 	total := int64(len(list))
-	s.conns = make(map[string]map[string]*websocket.Conn)
+	s.conns = make(map[string]map[string]*conn)
 	atomic.AddInt64(&s.metrics.conns, -total)
 	s.mu.Unlock()
 
 	for _, c := range list {
-		_ = c.Close(websocket.StatusNormalClosure, "server_shutdown")
+		c.stop()
+		_ = c.ws.Close(websocket.StatusNormalClosure, "server_shutdown")
 	}
 }
